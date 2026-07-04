@@ -22,7 +22,7 @@
 <script>
 "use strict";
 /* ============================================================
- * ORBIT BEAT — 원버튼 궤도 리듬게임
+ * ORBIT BEAT — 원버튼 궤도 리듬게임 · 놀이공원 에디션
  * 단일 파일 · Canvas 2D · Web Audio 합성 (외부 에셋 없음)
  *
  * 핵심 규칙:
@@ -31,6 +31,11 @@
  *    목표각 = 타일 n의 진행 방향. 공전 방향으로 남은 각도 Δ가
  *    그 타일의 박자 길이(Δ/180 비트)를 결정한다.
  *  - 시간 기준은 전부 AudioContext.currentTime (rAF는 렌더링 전용)
+ *
+ * 놀이공원 에디션:
+ *  - 맵 32개 (초급 10 / 중급 15 / 고급 7), 전부 놀이기구 테마
+ *  - 맵마다 다른 색 테마와 다른 음악(조성·진행·드럼·리드·시드 멜로디)
+ *  - 타격감: 줌 펀치 / 행성 팝 / 타일 플래시 / 콤보 / 콘페티 / 불꽃놀이
  * ============================================================ */
 
 /* ===================== 1. 공용 유틸 ===================== */
@@ -42,12 +47,23 @@ const rep    = (v, n) => Array(n).fill(v);
 const easeOutCubic = x => 1 - Math.pow(1 - x, 3);
 const noteFreq = semi => 440 * Math.pow(2, semi / 12); // A4 기준 반음 → 주파수
 
+// 시드 난수 (맵마다 같은 멜로디가 나오도록 결정적으로 생성)
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
 /* ===================== 2. 캔버스 / 리사이즈 ===================== */
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 let W = 0, H = 0, DPR = 1;
 let vignetteCv = null;   // 비네트 캐시 (리사이즈 때만 재생성)
 let stars = [];          // 배경 별 입자 40개
+let bgGrad = null, bgGradKey = ''; // 배경 그라데이션 캐시 (resize에서 무효화)
 
 // roundRect 폴리필 (구형 브라우저 대비)
 if (!CanvasRenderingContext2D.prototype.roundRect) {
@@ -69,7 +85,7 @@ function resize() {
   canvas.width = W * DPR; canvas.height = H * DPR;
   canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  // 비네트: 중앙 투명 → 가장자리 어둡게 (radial gradient 캐시)
+  // 비네트: 중앙 투명 → 가장자리 어둡게
   vignetteCv = document.createElement('canvas');
   vignetteCv.width = W; vignetteCv.height = H;
   const vc = vignetteCv.getContext('2d');
@@ -85,6 +101,7 @@ function resize() {
                  r: 0.6 + Math.random() * 1.4, z: 0.3 + Math.random() * 0.7,
                  tw: Math.random() * TAU });
   }
+  bgGradKey = '';
 }
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', resize);
@@ -93,20 +110,18 @@ resize();
 
 // 터치 기기 감지 — 안내 문구를 탭 기준으로 표시
 const IS_TOUCH = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
-// 길게 눌러 컨텍스트 메뉴가 뜨는 것 방지 (모바일)
 window.addEventListener('contextmenu', e => e.preventDefault());
 
 /* ===================== 3. 오디오 엔진 (전부 합성) ===================== */
 let actx = null;                 // AudioContext — 첫 사용자 입력 시 생성
 let master, musicBus, sfxBus;    // 버스: 음악 / 효과음 분리
+let noiseBuf = null;             // 화이트노이즈 버퍼
+let inputOffset = 0;             // 보정 오프셋(초). 변수로만 보관.
 
 /* ---- 모바일 오디오 잠금 해제 ----
- * iOS는 Web Audio를 기본적으로 '무음 스위치를 따르는' 세션으로 재생해서
- * 측면 스위치가 무음이면 게임 소리가 전부 죽는다. 대응 두 가지:
- *  1) navigator.audioSession.type='playback' (iOS 16.4+) — 무음 스위치 무시
- *  2) 무음 <audio> 루프 재생 (데이터 URI, 외부 파일 아님) — 구형 iOS에서
- *     오디오 세션을 미디어 재생 카테고리로 전환하는 공지된 기법
- * 또한 어떤 제스처든 컨텍스트가 suspended면 매번 resume을 재시도한다. */
+ * iOS 대응 3종 세트: (1) audioSession playback — 무음 스위치 무시,
+ * (2) 무음 <audio> 루프(데이터 URI) — 구형 iOS 세션 전환,
+ * (3) 제스처 안 무음 버퍼 '킥' — 출력 경로 개방. */
 try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
 const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
 let unmuteEl = null;
@@ -121,9 +136,7 @@ function unlockMedia() {
   const p = unmuteEl.play();
   if (p && p.catch) p.catch(() => {});
 }
-// iOS '킥': 제스처 안에서 무음 버퍼를 실제로 한 번 재생해야 출력 경로가 열린다.
-// (state가 running이어도 이걸 하기 전엔 소리가 안 나는 iOS 버그 대응 — 표준 기법)
-function kickAudio() {
+function kickAudio() { // iOS: 제스처 안에서 실제 노드를 한 번 재생해야 출력이 열림
   if (!actx) return;
   try {
     const src = actx.createBufferSource();
@@ -144,13 +157,11 @@ window.addEventListener('pointerdown', unlockAudio, true);
 window.addEventListener('touchend', unlockAudio, true);
 window.addEventListener('click', unlockAudio, true);
 window.addEventListener('keydown', unlockAudio, true);
-let noiseBuf = null;             // 화이트노이즈 버퍼 (하이햇·클랩·타격음용)
-let inputOffset = 0;             // 보정 화면에서 측정한 입력 오프셋(초). 변수로만 보관.
 
-// 룩어헤드 스케줄러 상태 — 25ms 간격으로 깨어나 100ms 앞까지 예약
+// 룩어헤드 스케줄러 — 25ms 간격으로 깨어나 100ms 앞까지 예약
 const LOOKAHEAD = 0.1, TICK_MS = 25;
 const music = { mode: 'off', step: 0, nextTime: 0, t0: 0,
-                baseBpm: 100, timeline: [] }; // timeline: [{rel, bpm}] BPM 변화 시점
+                baseBpm: 100, timeline: [] };
 
 function ensureAudio() {
   if (actx) { actx.resume(); return; }
@@ -165,11 +176,11 @@ function ensureAudio() {
   for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
   setInterval(schedule, TICK_MS);
   actx.resume();
-  kickAudio(); // 생성 직후 제스처 안에서 출력 경로 개방 (iOS)
+  kickAudio();
 }
 
-/* ---- 신스 악기: 킥 / 하이햇 / 클랩 / 베이스 / 리드 ---- */
-function playKick(t) { // 사인파 피치 드롭
+/* ---- 신스 악기 ---- */
+function playKick(t) {
   const o = actx.createOscillator(), g = actx.createGain();
   o.type = 'sine';
   o.frequency.setValueAtTime(160, t);
@@ -179,7 +190,7 @@ function playKick(t) { // 사인파 피치 드롭
   o.connect(g); g.connect(musicBus);
   o.start(t); o.stop(t + 0.3);
 }
-function playHat(t, vol) { // 노이즈 + 하이패스
+function playHat(t, vol) {
   const s = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
   s.buffer = noiseBuf; f.type = 'highpass'; f.frequency.value = 7500;
   g.gain.setValueAtTime(vol, t);
@@ -187,15 +198,15 @@ function playHat(t, vol) { // 노이즈 + 하이패스
   s.connect(f); f.connect(g); g.connect(musicBus);
   s.start(t); s.stop(t + 0.06);
 }
-function playClap(t) { // 노이즈 + 밴드패스 (백비트)
+function playClap(t, vol) {
   const s = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
   s.buffer = noiseBuf; f.type = 'bandpass'; f.frequency.value = 1800; f.Q.value = 1.2;
-  g.gain.setValueAtTime(0.16, t);
+  g.gain.setValueAtTime(vol || 0.16, t);
   g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
   s.connect(f); f.connect(g); g.connect(musicBus);
   s.start(t); s.stop(t + 0.12);
 }
-function playBass(t, freq, dur) { // 사각파 베이스
+function playBass(t, freq, dur) {
   const o = actx.createOscillator(), f = actx.createBiquadFilter(), g = actx.createGain();
   o.type = 'square'; o.frequency.value = freq;
   f.type = 'lowpass'; f.frequency.value = 640;
@@ -205,24 +216,43 @@ function playBass(t, freq, dur) { // 사각파 베이스
   o.connect(f); f.connect(g); g.connect(musicBus);
   o.start(t); o.stop(t + dur + 0.05);
 }
-function playLead(t, freq, dur) { // 톱니파 2개 디튠 + 로우패스 스윕
+// 리드: 맵별 음색 (saw 풍성 / square 명랑 / tri 부드러움 / pluck 통통)
+function playLead(t, freq, dur, type) {
   const g = actx.createGain(), f = actx.createBiquadFilter();
   f.type = 'lowpass';
+  const bright = type === 'pluck' ? 3200 : type === 'square' ? 2800 : 2400;
   f.frequency.setValueAtTime(700, t);
-  f.frequency.exponentialRampToValueAtTime(2400, t + 0.04);
-  f.frequency.exponentialRampToValueAtTime(850, t + dur);
+  f.frequency.exponentialRampToValueAtTime(bright, t + 0.03);
+  f.frequency.exponentialRampToValueAtTime(850, t + Math.max(0.09, dur));
+  const vol = type === 'tri' ? 0.16 : 0.1;
+  const sus = type === 'pluck' ? Math.min(dur, 0.16) : dur;
   g.gain.setValueAtTime(0.0001, t);
-  g.gain.exponentialRampToValueAtTime(0.1, t + 0.012);
-  g.gain.setValueAtTime(0.1, t + Math.max(0.012, dur - 0.05));
-  g.gain.exponentialRampToValueAtTime(0.001, t + dur + 0.08);
-  for (const det of [-6, 6]) {
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.012);
+  g.gain.setValueAtTime(vol, t + Math.max(0.012, sus - 0.05));
+  g.gain.exponentialRampToValueAtTime(0.001, t + sus + 0.08);
+  const waves = type === 'saw' ? [['sawtooth', -6], ['sawtooth', 6]]
+              : type === 'square' ? [['square', 0]]
+              : type === 'tri' ? [['triangle', 0]]
+              : [['square', -4], ['square', 5]]; // pluck
+  for (const [w, det] of waves) {
     const o = actx.createOscillator();
-    o.type = 'sawtooth'; o.frequency.value = freq; o.detune.value = det;
-    o.connect(f); o.start(t); o.stop(t + dur + 0.12);
+    o.type = w; o.frequency.value = freq; o.detune.value = det;
+    o.connect(f); o.start(t); o.stop(t + sus + 0.12);
   }
   f.connect(g); g.connect(musicBus);
 }
-function playTick(t, accent) { // 메트로놈 틱 (보정 화면) — 폰 스피커에서도 또렷하게
+function playPad(t, semi, dur) { // 마디 시작 화음 패드 (은은하게)
+  for (const s of [semi, semi + 7]) {
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = 'triangle'; o.frequency.value = noteFreq(s);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.045, t + 0.06);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(musicBus);
+    o.start(t); o.stop(t + dur + 0.05);
+  }
+}
+function playTick(t, accent) { // 메트로놈 틱 (보정 화면)
   const o = actx.createOscillator(), g = actx.createGain();
   o.type = 'square'; o.frequency.value = accent ? 1568 : 1046.5;
   g.gain.setValueAtTime(accent ? 0.34 : 0.24, t);
@@ -230,21 +260,47 @@ function playTick(t, accent) { // 메트로놈 틱 (보정 화면) — 폰 스�
   o.connect(g); g.connect(sfxBus);
   o.start(t); o.stop(t + 0.07);
 }
-function playHit(t, perfect) { // 착지 타격음: 짧은 클릭 + 핑 (완벽은 피치 상승)
+// 착지 타격음: 저음 '쿵' + 클릭 + 핑 3레이어 (타격감의 핵심)
+function playHit(t, perfect) {
+  const th = actx.createOscillator(), tg = actx.createGain(); // 저음 몸통
+  th.type = 'sine';
+  th.frequency.setValueAtTime(200, t);
+  th.frequency.exponentialRampToValueAtTime(64, t + 0.06);
+  tg.gain.setValueAtTime(0.5, t);
+  tg.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+  th.connect(tg); tg.connect(sfxBus);
+  th.start(t); th.stop(t + 0.14);
   const s = actx.createBufferSource(), hf = actx.createBiquadFilter(), ng = actx.createGain();
-  s.buffer = noiseBuf; hf.type = 'highpass'; hf.frequency.value = 4000;
-  ng.gain.setValueAtTime(0.14, t);
+  s.buffer = noiseBuf; hf.type = 'highpass'; hf.frequency.value = 4000; // 클릭
+  ng.gain.setValueAtTime(0.16, t);
   ng.gain.exponentialRampToValueAtTime(0.001, t + 0.02);
   s.connect(hf); hf.connect(ng); ng.connect(sfxBus);
   s.start(t); s.stop(t + 0.03);
-  const o = actx.createOscillator(), g = actx.createGain();
+  const o = actx.createOscillator(), g = actx.createGain(); // 핑
   o.type = 'triangle'; o.frequency.value = perfect ? 1318.5 : 987.8;
-  g.gain.setValueAtTime(0.13, t);
+  g.gain.setValueAtTime(0.14, t);
   g.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
   o.connect(g); g.connect(sfxBus);
   o.start(t); o.stop(t + 0.13);
+  if (perfect) { // 완벽: 반짝이 한 톨 추가
+    const o2 = actx.createOscillator(), g2 = actx.createGain();
+    o2.type = 'sine'; o2.frequency.value = 2637;
+    g2.gain.setValueAtTime(0.06, t + 0.02);
+    g2.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    o2.connect(g2); g2.connect(sfxBus);
+    o2.start(t + 0.02); o2.stop(t + 0.14);
+  }
 }
-function playFail(t) { // 미스: 하강 톱니파 + 노이즈 버스트
+function playComboDing(t, n) { // 10콤보마다 상승음
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'triangle';
+  o.frequency.value = noteFreq(Math.min(24, 7 + n * 2));
+  g.gain.setValueAtTime(0.16, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+  o.connect(g); g.connect(sfxBus);
+  o.start(t); o.stop(t + 0.34);
+}
+function playFail(t) {
   const o = actx.createOscillator(), g = actx.createGain();
   o.type = 'sawtooth';
   o.frequency.setValueAtTime(220, t);
@@ -260,60 +316,104 @@ function playFail(t) { // 미스: 하강 톱니파 + 노이즈 버스트
   s.connect(f); f.connect(ng); ng.connect(sfxBus);
   s.start(t); s.stop(t + 0.35);
 }
-function playFanfare(t) { // 클리어 아르페지오 (Am)
-  [0, 3, 7, 12].forEach((semi, i) => {
+function playFanfare(t) { // 클리어 팡파르 (장조 아르페지오 + 상행)
+  [0, 4, 7, 12, 16, 19, 24].forEach((semi, i) => {
     const o = actx.createOscillator(), g = actx.createGain();
-    const tt = t + i * 0.13;
-    o.type = 'triangle'; o.frequency.value = noteFreq(semi);
-    g.gain.setValueAtTime(0.14, tt);
+    const tt = t + i * 0.09;
+    o.type = 'triangle'; o.frequency.value = noteFreq(semi - 5);
+    g.gain.setValueAtTime(0.13, tt);
     g.gain.exponentialRampToValueAtTime(0.001, tt + 0.5);
     o.connect(g); g.connect(sfxBus);
     o.start(tt); o.stop(tt + 0.55);
   });
 }
 
-/* ---- 곡 데이터: 8마디 루프, A 마이너, 16분음표 128스텝 ---- */
-// 마디별 베이스 루트 (A4 기준 반음): Am Am F G / Am F C E
-const BASS_ROOTS = [-24, -24, -28, -26, -24, -28, -21, -29];
-// 리드 멜로디: [스텝, 반음, 길이(스텝)]
-const MELODY_EVENTS = [
-  [0, 0, 2], [4, 3, 2], [8, 7, 4], [14, 5, 2],
-  [16, 3, 2], [20, 2, 2], [24, 0, 6],
-  [32, 0, 2], [36, 3, 2], [40, 8, 4], [46, 7, 2],
-  [48, 5, 2], [52, 2, 2], [56, -2, 6],
-  [64, 7, 2], [68, 12, 4], [74, 10, 2], [76, 7, 2],
-  [80, 8, 2], [84, 7, 2], [88, 3, 4],
-  [96, 7, 2], [100, 10, 2], [104, 3, 4],
-  [112, 2, 4], [116, -1, 2], [120, 2, 6],
+/* ---- 음악 데이터: 맵마다 다른 곡을 만드는 파라메트릭 작곡 엔진 ---- */
+// 스케일 (도수 → 반음). 장조/자연단조/도리안/믹솔리디안
+const SCALES = {
+  maj:  [0, 2, 4, 5, 7, 9, 11],
+  min:  [0, 2, 3, 5, 7, 8, 10],
+  dor:  [0, 2, 3, 5, 7, 9, 10],
+  mixo: [0, 2, 4, 5, 7, 9, 10],
+};
+function degSemi(scale, deg) { // 1-기준 도수(7 초과 = 옥타브 위) → 반음
+  const d = deg - 1;
+  return 12 * Math.floor(d / 7) + SCALES[scale][((d % 7) + 7) % 7];
+}
+// 드럼 스타일 (16분음표 16스텝 기준 배치)
+const DRUMS = {
+  four:   { kick: [0, 4, 8, 12], clap: [4, 12], hat: [2, 6, 10, 14], ghost: [7, 15] },
+  bounce: { kick: [0, 8],        clap: [4, 12], hat: [2, 6, 10, 14], ghost: [] },      // 움파(놀이공원)
+  drive:  { kick: [0, 6, 8, 12], clap: [4, 12], hat: [0, 2, 4, 6, 8, 10, 12, 14], ghost: [] },
+  half:   { kick: [0],           clap: [8],     hat: [4, 12],        ghost: [10] },
+};
+// 멜로디 리듬 템플릿 (마디 안에서 음이 놓이는 스텝)
+const RHYTHMS = [
+  [0, 4, 8, 12], [0, 4, 8, 10, 12], [0, 6, 8, 12], [0, 4, 6, 8, 12], [0, 8, 12], [0, 3, 6, 8, 12],
 ];
-const MELODY = new Map(MELODY_EVENTS.map(e => [e[0], e]));
+// 맵의 song 스펙 → 실제 재생 데이터(멜로디는 시드 기반 결정적 생성)
+function compileSong(level, idx) {
+  const sp = level.song;
+  const rng = mulberry32(idx * 7919 + 13);
+  const prog = sp.prog;
+  const melody = new Map();
+  let cur = 8; // 도수 커서 (루트 옥타브 위 부근)
+  for (let bar = 0; bar < 8; bar++) {
+    const c = prog[bar % prog.length];
+    const chord = [c + 7, c + 9, c + 11, c + 14]; // 옥타브 위 코드톤
+    const rhythm = RHYTHMS[Math.floor(rng() * RHYTHMS.length)];
+    for (let i = 0; i < rhythm.length; i++) {
+      const s = rhythm[i];
+      let deg;
+      if (bar === 7 && i === rhythm.length - 1) deg = 8; // 마지막은 으뜸음으로 종지
+      else if (rng() < 0.62) deg = chord[Math.floor(rng() * chord.length)];
+      else deg = cur + (rng() < 0.5 ? 1 : -1); // 순차 진행
+      deg = clamp(deg, 6, 17);
+      cur = deg;
+      const next = i + 1 < rhythm.length ? rhythm[i + 1] : 16;
+      melody.set(bar * 16 + s, [sp.key + degSemi(sp.scale, deg), Math.min(next - s, 6)]);
+    }
+  }
+  return { ...sp, drums: DRUMS[sp.drums], drumStyle: sp.drums, melody };
+}
 
-// 현재 스케줄 시각(t0 기준 상대 초)의 BPM — 속도 변경 타일 반영
 function musicBpmAt(rel) {
   let b = music.baseBpm;
   for (const c of music.timeline) { if (rel >= c.rel - 1e-6) b = c.bpm; else break; }
   return b;
 }
-// 한 스텝(16분음표) 분량의 음표 예약
+let flashAt = -9, rayAt = -9; // 다운비트 플래시/광선 트리거 (스케줄러가 기록)
 function scheduleStep(step, t) {
+  const song = R && R.songData;
+  if (!song) return;
   const bpm = musicBpmAt(t - music.t0);
-  const stepDur = 15 / bpm; // 60/bpm/4
+  const stepDur = 15 / bpm;
   const bar = Math.floor(step / 16) % 8;
-  if (step % 4 === 0) playKick(t);                        // 포온더플로어 킥
-  if (step % 4 === 2) playHat(t, 0.22);                   // 오프비트 하이햇
-  if (step % 16 === 7 || step % 16 === 15) playHat(t, 0.09); // 고스트 햇
-  if (step % 16 === 4 || step % 16 === 12) playClap(t);   // 백비트 클랩
-  if (step % 2 === 0) {                                   // 8분음표 베이스
-    let semi = BASS_ROOTS[bar];
-    if (step % 16 === 6) semi += 12;                      // 옥타브 점프
-    if (step % 16 === 14) semi += 7;                      // 5도
-    playBass(t, noteFreq(semi), stepDur * 1.7);
+  const s16 = step % 16;
+  const d = song.drums;
+  if (d.kick.includes(s16)) playKick(t);
+  if (d.clap.includes(s16)) playClap(t, 0.16);
+  if (d.hat.includes(s16)) playHat(t, song.drumStyle === 'drive' && s16 % 4 === 2 ? 0.26 : 0.2);
+  if (d.ghost.includes(s16)) playHat(t, 0.09);
+  // 베이스: 스타일별 패턴
+  const rootSemi = song.key - 24 + degSemi(song.scale, song.prog[bar % song.prog.length]);
+  if (song.drumStyle === 'bounce') {          // 움파: 저음-5도 교대 (경쾌한 놀이공원 리듬)
+    if (s16 === 0 || s16 === 8) playBass(t, noteFreq(rootSemi), stepDur * 3);
+    if (s16 === 4 || s16 === 12) playBass(t, noteFreq(rootSemi + 7), stepDur * 3);
+  } else if (song.drumStyle === 'drive') {    // 드라이브: 8분음표 질주
+    if (s16 % 2 === 0) playBass(t, noteFreq(s16 % 8 === 6 ? rootSemi + 12 : rootSemi), stepDur * 1.7);
+  } else {                                    // four/half: 펌핑
+    if (s16 % 2 === 0) playBass(t, noteFreq(s16 === 14 ? rootSemi + 7 : rootSemi), stepDur * 1.7);
   }
-  const m = MELODY.get(step % 128);                       // 리드 멜로디
-  if (m) playLead(t, noteFreq(m[1]), m[2] * stepDur);
+  if (s16 === 0) {
+    playPad(t, song.key - 12 + degSemi(song.scale, song.prog[bar % song.prog.length]), stepDur * 12);
+    flashAt = t;                              // 다운비트 화면 플래시
+    if (step % 64 === 0) rayAt = t;           // 4마디마다 방사 광선
+  }
+  const m = song.melody.get(step % 128);
+  if (m) playLead(t, noteFreq(m[0]), m[1] * stepDur, song.lead);
 }
 
-// 룩어헤드 스케줄러 본체 — 25ms마다 실행, 100ms 앞까지 예약
 function schedule() {
   if (!actx) return;
   if (music.mode === 'music') {
@@ -324,82 +424,162 @@ function schedule() {
       music.step = (music.step + 1) % 128;
     }
   } else if (music.mode === 'calib') {
-    // 오디오가 실제로 구동되기 전엔 메트로놈 시작을 미룬다
-    // (iOS에서 첫 탭 직후 컨텍스트가 아직 안 열린 상태로 비트가 시작되는 것 방지)
+    // 오디오가 실제로 구동되기 전엔 메트로놈 시작을 미룬다 (iOS 첫 탭 대응)
     if (actx.state !== 'running') { music.nextTime = actx.currentTime + 0.4; return; }
     while (music.nextTime < actx.currentTime + LOOKAHEAD) {
       playTick(music.nextTime, music.step % 4 === 0);
       calib.beatTimes.push(music.nextTime);
       if (calib.beatTimes.length > 24) calib.beatTimes.shift();
-      music.nextTime += 60 / 100; // 100 BPM 메트로놈
+      music.nextTime += 60 / 100;
       music.step++;
     }
   }
 }
 function stopMusic() { music.mode = 'off'; }
 
-/* ===================== 4. 레벨 데이터 ===================== */
-// angles[i] = 타일 i에서 타일 i+1로 가는 방향각(도). 화면 좌표계(y 아래) 기준.
-// vortex: 착지 시 공전 방향이 반전되는 타일 인덱스
-// speed:  {타일 인덱스: 기본 BPM 대비 배속} — 그 타일부터 적용
+/* ===================== 4. 비주얼 테마 ===================== */
+// 놀이공원 팔레트 8종 — 어두운 바탕 + 맵별 포인트 색
+const THEMES = {
+  candy:  { bg: ['#150a1a', '#241233'], star: '#ffd9ec', track: '#332440', edge: '#5f4a75', accent: '#ff9ad5', accent2: '#7ae0ff' },
+  mint:   { bg: ['#071310', '#0e211c'], star: '#c8ffe9', track: '#20362e', edge: '#41685a', accent: '#6affc2', accent2: '#ffd76a' },
+  sunset: { bg: ['#170b10', '#2b1120'], star: '#ffd9b3', track: '#3a232b', edge: '#6f434c', accent: '#ff9d5c', accent2: '#ff5c8a' },
+  neon:   { bg: ['#07070f', '#121228'], star: '#c5f6ff', track: '#1d2340', edge: '#404e82', accent: '#00e8ff', accent2: '#ff2de2' },
+  gold:   { bg: ['#130e07', '#251b0c'], star: '#ffeec0', track: '#352b18', edge: '#6f5d34', accent: '#ffd76a', accent2: '#ff8a5c' },
+  ocean:  { bg: ['#06101a', '#0a1d33'], star: '#bfe8ff', track: '#172b40', edge: '#355c80', accent: '#4ac2ff', accent2: '#8affd0' },
+  violet: { bg: ['#0d0a1a', '#1a1136'], star: '#d9ccff', track: '#272045', edge: '#4d4180', accent: '#a06aff', accent2: '#ff8ad5' },
+  ember:  { bg: ['#150808', '#280d0d'], star: '#ffccb8', track: '#361b1b', edge: '#703d34', accent: '#ff6a3d', accent2: '#ffd76a' },
+};
+
+/* ===================== 5. 맵 데이터 (32개 · 놀이공원) ===================== */
+/* 맵은 토큰 문자열로 정의한다 (진행 방향 커서 방식):
+ *   S = 직진(1박)  R/L = 90도 우/좌회전(1.5박/0.5박)
+ *   r/l = 45도 우/좌회전(1.25박/0.75박)  U = U턴(2박, 숨 고르기)
+ *   V = 다음 타일에 소용돌이(공전 반전)  F/H/N = 다음 타일부터 1.5x/0.5x/원속
+ * 회전 후엔 커서가 바뀌므로 문자열이 곧 트랙 모양이자 리듬 악보가 된다. */
+function buildMap(pattern) {
+  let dir = 0;
+  const angles = [], vortex = [], speed = {};
+  for (const ch of pattern) {
+    if (ch === 'R') dir = mod360(dir + 90);
+    else if (ch === 'L') dir = mod360(dir - 90);
+    else if (ch === 'r') dir = mod360(dir + 45);
+    else if (ch === 'l') dir = mod360(dir - 45);
+    else if (ch === 'U') dir = mod360(dir + 180);
+    else if (ch === 'V') { vortex.push(angles.length); continue; }
+    else if (ch === 'F') { speed[angles.length] = 1.5; continue; }
+    else if (ch === 'H') { speed[angles.length] = 0.5; continue; }
+    else if (ch === 'N') { speed[angles.length] = 1; continue; }
+    else if (ch !== 'S') continue;
+    angles.push(dir);
+  }
+  return { angles, vortex, speed };
+}
+// 레벨 정의 헬퍼: L(단계, 이름, BPM, 패턴, 곡 스펙, 테마)
+function L(tier, name, bpm, pattern, song, theme) {
+  const m = buildMap(pattern);
+  return { tier, name, bpm, angles: m.angles, vortex: m.vortex, speed: m.speed,
+           song, theme: THEMES[theme] };
+}
+// 곡 스펙 헬퍼: 키(반음), 스케일, 코드진행(도수 8마디), 드럼, 리드
+function S(key, scale, prog, drums, lead) { return { key, scale, prog, drums, lead }; }
+
 const LEVELS = [
-  {
-    name: '튜토리얼', sub: '직선 · 일정한 박자', bpm: 100,
-    angles: rep(0, 32), vortex: [], speed: {},
-  },
-  {
-    name: '중급', sub: '90° 꺾임 · 소용돌이', bpm: 110,
-    angles: [
-      ...rep(0, 8),
-      270, 0, 270, 0, 270, 0,   // 계단 위로: 0.5 / 1.5 박 스윙
-      ...rep(0, 4),
-      0, 0, 0,                  // (18번 타일에 소용돌이)
-      270, 0, 270, 0, 270, 0,   // 같은 모양이지만 방향 반전 → 1.5 / 0.5 박
-      ...rep(0, 5),             // (27번 타일에 소용돌이로 복귀)
-    ],
-    vortex: [18, 27], speed: {},
-  },
-  {
-    name: '고급', sub: '45° 지그재그 · 속도 변화', bpm: 120,
-    angles: [
-      ...rep(0, 4),
-      45, 0, 315, 0, 45, 0, 315, 0, // 45° 스윙: 1.25 / 0.75 박
-      0, 0,
-      ...rep(0, 6),                 // (14번부터 1.5배속 직선)
-      0, 0,                         // (20번부터 원속)
-      ...rep(0, 4),                 // (22번부터 0.5배속 직선)
-      45, 315, 45, 315,             // (26번부터 원속) 대각 계단
-      ...rep(0, 4),
-    ],
-    vortex: [], speed: { 14: 1.5, 20: 1, 22: 0.5, 26: 1 },
-  },
+  /* ---------- 초급 10: 놀이공원 입장 ---------- */
+  L(0, '회전목마',     100, 'S'.repeat(28),
+    S(-5, 'maj', [1, 4, 1, 5, 1, 4, 5, 1], 'bounce', 'tri'), 'candy'),
+  L(0, '꼬마기차',     104, 'SSSSSSRLSSSSSSLRSSSSSS',
+    S(-7, 'maj', [1, 5, 6, 4, 1, 5, 4, 1], 'bounce', 'square'), 'mint'),
+  L(0, '솜사탕 구름',  106, 'SSSSSUSSSSRLSSSSUSSSS',
+    S(-4, 'maj', [1, 6, 4, 5, 1, 6, 2, 5], 'half', 'tri'), 'candy'),
+  L(0, '풍선 정원',    108, 'SSSRSSRSSRSSRSSSLSSLSSLSSLSSS',
+    S(-2, 'mixo', [1, 7, 4, 1, 1, 7, 4, 5], 'bounce', 'square'), 'gold'),
+  L(0, '티컵 스핀',    110, 'SSSSSVSSSSSVSSSSSVSSSS',
+    S(-6, 'maj', [1, 4, 5, 1, 6, 4, 5, 1], 'four', 'pluck'), 'violet'),
+  L(0, '퍼레이드 거리', 112, 'SSSSRLSSRLSSRLSSSS',
+    S(-3, 'mixo', [1, 4, 1, 5, 1, 4, 5, 5], 'drive', 'square'), 'gold'),
+  L(0, '거울 미로',    108, 'SSSRLSSLRSSRLSSLRSSS',
+    S(-8, 'maj', [1, 3, 4, 5, 1, 3, 2, 5], 'four', 'tri'), 'ocean'),
+  L(0, '문어 다리',    114, 'SSSSRLRLSSSSLRLRSSSS',
+    S(-5, 'dor', [1, 4, 1, 4, 6, 4, 5, 5], 'four', 'pluck'), 'neon'),
+  L(0, '미니 코스터',  116, 'SSSSRLRLRLSSSSLRLRLRSSSS',
+    S(-4, 'mixo', [1, 7, 1, 7, 4, 5, 4, 5], 'drive', 'saw'), 'sunset'),
+  L(0, '불꽃 전야',    118, 'SSSSRLRLSSVSSRLRLSSVSSSS',
+    S(-6, 'maj', [1, 5, 6, 4, 1, 5, 2, 5], 'drive', 'square'), 'ember'),
+
+  /* ---------- 중급 15: 본격 어트랙션 ---------- */
+  L(1, '바이킹',       118, 'SSSSRLRLRLRLSSUSSLRLRLRLRSSSS',
+    S(-7, 'min', [1, 6, 3, 7, 1, 6, 7, 7], 'drive', 'saw'), 'ocean'),
+  L(1, '범퍼카',       122, 'SSSRSSRSSRSSRSSLLSSLSSLSSLSSSS',
+    S(-3, 'dor', [1, 4, 1, 4, 1, 4, 5, 4], 'four', 'pluck'), 'neon'),
+  L(1, '회전그네',     120, 'SSSSVRLRLSSVRLRLSSVSSSS',
+    S(-5, 'maj', [1, 4, 6, 5, 1, 4, 2, 5], 'bounce', 'square'), 'candy'),
+  L(1, '대관람차',     116, 'SSSSRRRRSSRRRRSSRRRRSSSS',
+    S(-8, 'maj', [1, 6, 2, 5, 1, 6, 4, 5], 'bounce', 'tri'), 'violet'),
+  L(1, '후룸라이드',   124, 'SSSSSSFSSSSSSNSSRLRLSSFSSSSNSSSS',
+    S(-4, 'mixo', [1, 7, 4, 4, 1, 7, 5, 5], 'drive', 'saw'), 'ocean'),
+  L(1, '디스코팡팡',   126, 'SSRLSSLRSSRLLRSSRLRLSS',
+    S(-2, 'dor', [1, 4, 5, 4, 1, 4, 7, 5], 'four', 'pluck'), 'gold'),
+  L(1, '유령의 집',    115, 'SSSSVSSRLSSVSSLRSSVSSUSS',
+    S(-9, 'min', [1, 6, 4, 5, 1, 3, 7, 5], 'half', 'saw'), 'violet'),
+  L(1, '정글 탐험',    122, 'SSSSRLRLSSLLLLSSRLRLSSSS',
+    S(-6, 'dor', [1, 7, 4, 1, 1, 7, 5, 5], 'drive', 'pluck'), 'mint'),
+  L(1, '스카이 스윙',  124, 'SSSSRLSSRLRLSSRLRLRLSSSS',
+    S(-5, 'maj', [1, 5, 4, 5, 6, 5, 4, 5], 'four', 'square'), 'candy'),
+  L(1, '카니발 대로',  128, 'SSSSRLRLSSRRRRSSLRLRSSSS',
+    S(-3, 'mixo', [1, 4, 1, 5, 1, 4, 7, 5], 'drive', 'saw'), 'gold'),
+  L(1, '미러볼 나이트', 126, 'SSRLLRRLSSLRRLLRSS',
+    S(-7, 'dor', [1, 4, 6, 5, 1, 4, 2, 5], 'four', 'pluck'), 'neon'),
+  L(1, '폭포 소용돌이', 122, 'SSSSVRLRLVSSVLRLRVSSSS',
+    S(-6, 'min', [1, 7, 6, 7, 1, 7, 4, 5], 'drive', 'saw'), 'ocean'),
+  L(1, '번개 열차',    130, 'SSSSRLRLRLRLRLSSSSLRLRLRLRLRSSSS',
+    S(-4, 'mixo', [1, 7, 1, 7, 1, 4, 5, 7], 'drive', 'square'), 'ember'),
+  L(1, '마법의 성',    120, 'SSSSRSSRSSRRSSUSSLLSSLSSLSSSS',
+    S(-8, 'maj', [1, 3, 6, 4, 1, 3, 2, 5], 'bounce', 'tri'), 'violet'),
+  L(1, '별빛 회전문',  128, 'SSSSLLLLSSRRRRSSLLLLSSSS',
+    S(-5, 'maj', [1, 6, 4, 5, 1, 6, 2, 5], 'four', 'square'), 'candy'),
+
+  /* ---------- 고급 7: 익스트림 존 ---------- */
+  L(2, '롤러코스터 X', 138, 'SSSSrlrlSSRLRLSSrlrlSSSS',
+    S(-7, 'min', [1, 6, 7, 1, 1, 6, 4, 7], 'drive', 'saw'), 'ember'),
+  L(2, '자이로드롭',   140, 'SSSSFSSSSSSNSSHSSNSSrlrlSSSS',
+    S(-5, 'dor', [1, 4, 1, 7, 1, 4, 5, 7], 'drive', 'pluck'), 'neon'),
+  L(2, '우주 열차',    144, 'SSSSrlrlrlSSVSSlrlrlrSSSS',
+    S(-8, 'min', [1, 7, 6, 7, 1, 3, 6, 7], 'four', 'saw'), 'ocean'),
+  L(2, '화염 코스터',  146, 'SSSSRLRLFSSSSNrlrlSSSS',
+    S(-4, 'mixo', [1, 7, 4, 7, 1, 7, 5, 7], 'drive', 'saw'), 'ember'),
+  L(2, '태풍의 눈',    150, 'SSSSVrlrlVSSRLRLVSSllllSSSS',
+    S(-6, 'min', [1, 6, 7, 5, 1, 6, 4, 7], 'drive', 'pluck'), 'violet'),
+  L(2, '유성우 특급',  155, 'SSSSrlrlRLRLrlrlSSFSSSSNSSSS',
+    S(-5, 'dor', [1, 7, 1, 7, 4, 5, 1, 7], 'drive', 'saw'), 'neon'),
+  L(2, '그랜드 피날레', 160, 'SSSSRLRLrlrlSSVRLRLSSFSSSSNSSRRRRSSSS',
+    S(-3, 'maj', [1, 5, 6, 4, 1, 5, 4, 5], 'drive', 'square'), 'gold'),
+];
+const TIERS = [
+  { name: '초급', color: '#7ae0ff' },
+  { name: '중급', color: '#ffd76a' },
+  { name: '고급', color: '#ff6a8a' },
 ];
 
-/* ===================== 5. 타이밍 계산 (게임의 심장) ===================== */
+/* ===================== 6. 타이밍 계산 (게임의 심장) ===================== */
 const TILE = 64;        // 타일 간 거리 = 공전 반지름(px)
 const INTRO_BEATS = 4;  // 첫 착지 전 카운트인 박자 수
 const TILE_TH = 26;     // 트랙 두께
 
-/*
- * 트랙 전체의 이론상 도착 시각을 곡 시작 시점에 전부 미리 계산.
- * 타일 i→i+1 이동:
- *   시작각 = (i===0 ? angles[0] : angles[i-1]) + 180  (직전 타일을 가리키는 각)
- *   목표각 = angles[i]
- *   Δ = 공전 방향 d로 시작각에서 목표각까지 도는 각도 (0이면 360으로 처리)
- *   박자 = Δ / 180,  소요 시간 = 박자 × (60 / 그 구간 BPM)
- */
+/* 트랙 전체의 이론상 도착 시각을 곡 시작 시점에 전부 미리 계산.
+ * 타일 i→i+1: 시작각 = (직전 방향+180), 목표각 = 현재 방향.
+ * 공전 방향 d로 도는 각도 Δ (0이면 360) → 박자 = Δ/180. */
 function buildTiming(level) {
   const N = level.angles.length;
   const tiles = [];
   let x = 0, y = 0, d = 1, mult = 1, arrival = 0;
   for (let i = 0; i < N; i++) {
-    if (level.vortex.includes(i)) d = -d;                 // 소용돌이: 방향 반전
-    if (level.speed[i] !== undefined) mult = level.speed[i]; // 속도 변경
+    if (level.vortex.includes(i)) d = -d;
+    if (level.speed[i] !== undefined) mult = level.speed[i];
     const bpm = level.bpm * mult, spb = 60 / bpm;
     const startAngle = (i === 0 ? level.angles[0] : level.angles[i - 1]) + 180;
     const target = level.angles[i];
     let delta = mod360(d * (target - startAngle));
-    if (delta < 1e-9) delta = 360;                        // 완전 한 바퀴
+    if (delta < 1e-9) delta = 360;
     const beats = delta / 180;
     tiles.push({ x, y, out: level.angles[i], dir: d, bpm, spb,
                  beats, delta, arrival,
@@ -409,19 +589,18 @@ function buildTiming(level) {
     x += TILE * Math.cos(level.angles[i] * D2R);
     y += TILE * Math.sin(level.angles[i] * D2R);
   }
-  // 마지막 타일 (도착 지점)
   tiles.push({ x, y, out: level.angles[N - 1], dir: d,
                bpm: level.bpm * mult, spb: 60 / (level.bpm * mult),
                beats: 0, delta: 0, arrival, vortex: false });
   return tiles;
 }
 
-/* ===================== 6. 게임 상태 / 런 관리 ===================== */
-// 상태: title → calib → select → play ⇄ (pause/countdown/dead) → clear → result
+/* ===================== 7. 게임 상태 / 런 관리 ===================== */
 let state = 'title';
 let calibDone = false;
 let levelIdx = 0;
-let R = null; // 현재 런(run) 데이터
+let selTab = 0;          // 레벨 선택 탭 (0 초급 / 1 중급 / 2 고급)
+let R = null;            // 현재 런
 
 const JUDGE = {
   perfect: { txt: '완벽',      color: '#ffd76a', w: 1    },
@@ -435,12 +614,13 @@ const calib = { taps: [], beatTimes: [], done: false };
 
 // 카메라 / 이펙트 상태
 const cam = { x: 0, y: 0 };
-let shake = 0;
-let popups = [], shocks = [], parts = [], trail = [], errTicks = [];
-let deadAnim = null;    // 죽은 행성 비행 애니메이션
-let clearT = 0;         // 클리어 시각
-let countdownT0 = 0;    // 일시정지 해제 카운트다운 시작(performance 기준 — 렌더링 전용)
-const grades = [null, null, null]; // 세션 내 레벨별 최고 등급
+let shake = 0, zoomKick = 0, rotKick = 0;
+let popups = [], shocks = [], parts = [], trail = [], errTicks = [], rays = [];
+let deadAnim = null;
+let clearT = 0;
+let countdownT0 = 0;
+let planetPopT = -9, comboPopT = -9;
+const grades = rep(null, LEVELS.length); // 세션 내 레벨별 최고 등급
 
 function newStats(keepDeaths) {
   const deaths = keepDeaths && R ? R.stats.deaths : 0;
@@ -448,21 +628,21 @@ function newStats(keepDeaths) {
            deaths, inputs: 0, weight: 0 };
 }
 
-// 런 시작(및 미스 후 재시작). 음악과 판정 타임라인을 같은 t0에서 출발시킨다.
 function startRun(li, keepDeaths) {
   const level = LEVELS[li];
   const tiles = buildTiming(level);
   const spb0 = 60 / level.bpm;
-  const musicStart = actx.currentTime + 0.3;      // 예약 여유
-  const t0 = musicStart + INTRO_BEATS * spb0;     // 타일 0 기준 시각
+  const musicStart = actx.currentTime + 0.3;
+  const t0 = musicStart + INTRO_BEATS * spb0;
   R = {
     level, li, tiles, t0,
-    idx: 0,                                       // 현재 고정 행성이 있는 타일
-    lastLand: -1,
+    idx: 0, lastLand: -1,
     stats: newStats(keepDeaths),
     finished: false,
+    songData: compileSong(level, li),
+    combo: 0, maxCombo: keepDeaths && R ? R.maxCombo : 0,
+    flashT: rep(-9, tiles.length),   // 타일별 착지 플래시 시각
   };
-  // 음악 스케줄러 초기화 — BPM 변화 타임라인을 판정과 공유
   music.mode = 'music';
   music.step = 0;
   music.nextTime = musicStart;
@@ -475,19 +655,19 @@ function startRun(li, keepDeaths) {
   }
   musicBus.gain.cancelScheduledValues(actx.currentTime);
   musicBus.gain.setValueAtTime(0.72, actx.currentTime);
-  // 이펙트/카메라 초기화
-  popups = []; shocks = []; parts = []; trail = []; errTicks = [];
-  deadAnim = null; shake = 0;
+  popups = []; shocks = []; parts = []; trail = []; errTicks = []; rays = [];
+  deadAnim = null; shake = 0; zoomKick = 0; rotKick = 0;
+  planetPopT = -9; comboPopT = -9; flashAt = -9; rayAt = -9;
   cam.x = tiles[0].x + TILE; cam.y = tiles[0].y;
   state = 'play';
 }
 function startGame(li) { levelIdx = li; startRun(li, false); }
 
-/* ---- 현재 공전 행성의 각도 (도착 시각에서 역산 → 항상 정확히 도착) ---- */
+/* ---- 공전 행성 각도/위치 (도착 시각에서 역산 → 항상 정확히 도착) ---- */
 function orbitAngle(now) {
   const seg = R.tiles[R.idx];
   const tArr = R.t0 + R.tiles[R.idx + 1].arrival;
-  const omega = 180 / seg.spb;                    // 도/초
+  const omega = 180 / seg.spb;
   return seg.out - seg.dir * omega * (tArr - now);
 }
 function orbitPos(now) {
@@ -496,22 +676,19 @@ function orbitPos(now) {
   return { x: seg.x + TILE * Math.cos(a), y: seg.y + TILE * Math.sin(a) };
 }
 
-/* ===================== 7. 판정 시스템 ===================== */
-/*
- * 각도 기반 판정: 입력 시점과 이론상 도착 시각의 차이를 각도로 환산.
- *   errDeg = (입력시각 - 도착시각) / spb × 180   (음수 = 빠름)
- *   ±25° 완벽 / ±25~45° 살짝 / ±45~60° 빠름!·느림! / -60° 미만 과입력 미스
- *   +60° 초과(입력 없이 지나침)는 update()에서 자동 미스
- */
+/* ===================== 8. 판정 시스템 ===================== */
+/* 각도 기반: errDeg = (입력시각-도착시각)/spb × 180 (음수 = 빠름)
+ * ±25 완벽 / ±45 살짝 / ±60 빠름!·느림! / -60 미만 과입력 미스
+ * +60 초과(지나침)는 update()에서 자동 미스 */
 function gamePress(tRaw) {
   if (state !== 'play' || R.finished) return;
-  if (tRaw - R.lastLand < 0.045) return;          // 다중 키 동시 입력 보호
-  const t = tRaw - inputOffset;                    // 보정 오프셋 적용
+  if (tRaw - R.lastLand < 0.045) return;
+  const t = tRaw - inputOffset;
   const seg = R.tiles[R.idx];
   const tArr = R.t0 + R.tiles[R.idx + 1].arrival;
   const errDeg = (t - tArr) / seg.spb * 180;
-  if (errDeg < -60) { die(tRaw, '너무 빠름!'); return; }  // 과입력 → 행성 폭발
-  if (errDeg > 60)  { die(tRaw, '놓침'); return; }        // 방어적 처리
+  if (errDeg < -60) { die(tRaw, '너무 빠름!'); return; }
+  if (errDeg > 60)  { die(tRaw, '놓침'); return; }
   const a = Math.abs(errDeg);
   let key;
   if (a <= 25) key = 'perfect';
@@ -522,79 +699,101 @@ function gamePress(tRaw) {
 
 function land(tRaw, key, errDeg) {
   const j = JUDGE[key];
+  const th = R.level.theme;
   R.idx++;
   R.lastLand = tRaw;
   R.stats[key]++; R.stats.inputs++; R.stats.weight += j.w;
   const tl = R.tiles[R.idx];
-  // 판정 팝업 + 충격파 + (완벽) 입자 + 카메라 흔들림
-  popups.push({ txt: j.txt, color: j.color, x: tl.x, y: tl.y, t0: tRaw });
-  shocks.push({ x: tl.x, y: tl.y, t0: tRaw });
-  if (key === 'perfect') {
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * TAU + Math.random() * 0.5;
-      parts.push({ x: tl.x, y: tl.y, vx: Math.cos(a) * 90, vy: Math.sin(a) * 90,
-                   t0: tRaw, life: 0.4, color: '#ffd76a' });
+  const perfect = key === 'perfect';
+  // 콤보: 완벽/살짝은 잇고 빠름!/느림!은 끊김
+  if (key === 'early2' || key === 'late2') R.combo = 0;
+  else {
+    R.combo++;
+    R.maxCombo = Math.max(R.maxCombo, R.combo);
+    comboPopT = tRaw;
+    if (R.combo % 10 === 0) { // 10콤보 마일스톤: 광선 + 상승 딩
+      rays.push({ x: tl.x, y: tl.y, t0: tRaw, color: th.accent });
+      playComboDing(actx.currentTime, R.combo / 10);
     }
   }
-  shake = key === 'perfect' ? 2 : 1.4;
-  trail = [];                                      // 공수 교대 → 잔상 리셋
+  // 타격감 패키지: 팝업 + 이중 충격파 + 콘페티 + 줌 펀치 + 셰이크 + 행성 팝 + 타일 플래시
+  popups.push({ txt: j.txt, color: j.color, x: tl.x, y: tl.y, t0: tRaw });
+  shocks.push({ x: tl.x, y: tl.y, t0: tRaw, color: '#ffffff' });
+  if (perfect) shocks.push({ x: tl.x, y: tl.y, t0: tRaw + 0.05, color: th.accent });
+  if (perfect) {
+    const confettiColors = [th.accent, th.accent2, '#ffffff'];
+    for (let i = 0; i < 9; i++) {
+      const a = (i / 9) * TAU + Math.random() * 0.6;
+      const sp = 70 + Math.random() * 90;
+      parts.push({ x: tl.x, y: tl.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 30,
+                   t0: tRaw, life: 0.55 + Math.random() * 0.25, grav: 160,
+                   rot: Math.random() * TAU, rect: Math.random() < 0.6,
+                   color: confettiColors[i % 3] });
+    }
+  }
+  if (parts.length > 150) parts.splice(0, parts.length - 150);
+  zoomKick = Math.min(0.09, zoomKick + (perfect ? 0.055 : 0.035));
+  shake = perfect ? 3.4 : 2.4;
+  planetPopT = tRaw;
+  R.flashT[R.idx] = tRaw;
+  if (tl.vortex) rotKick += (Math.random() < 0.5 ? 1 : -1) * 2.5; // 소용돌이 회전 킥
+  trail = [];
   errTicks.push({ deg: errDeg, t0: tRaw });
-  playHit(actx.currentTime, key === 'perfect');
-  if (R.idx >= R.tiles.length - 1) {               // 마지막 타일 착지 → 클리어
+  playHit(actx.currentTime, perfect);
+  if (R.idx >= R.tiles.length - 1) { // 클리어!
     R.finished = true;
     clearT = tRaw;
     state = 'clear';
     stopMusic();
     musicBus.gain.setTargetAtTime(0, actx.currentTime + 0.4, 0.5);
-    playFanfare(actx.currentTime + 0.35);
+    playFanfare(actx.currentTime + 0.3);
     finalizeResult();
   }
 }
 
-// 결과 집계: 가중 정확도와 등급 (미스가 있으면 A 이하)
 function finalizeResult() {
   const s = R.stats;
   s.acc = s.inputs ? (s.weight / s.inputs) * 100 : 100;
   let g;
   if (s.acc >= 95) g = 'S'; else if (s.acc >= 88) g = 'A';
   else if (s.acc >= 75) g = 'B'; else g = 'C';
-  if (s.deaths > 0 && g === 'S') g = 'A';
+  if (s.deaths > 0 && g === 'S') g = 'A'; // 노미스가 아니면 S 불가
   s.grade = g;
   const order = ['C', 'B', 'A', 'S'];
   if (!grades[R.li] || order.indexOf(g) > order.indexOf(grades[R.li])) grades[R.li] = g;
 }
 
-// 미스: 공전 행성이 궤도를 이탈해 날아가며 페이드아웃 → 1초 후 재시작
 function die(now, reason) {
   const seg = R.tiles[R.idx];
   const p = orbitPos(now);
   const a = orbitAngle(now) * D2R;
-  const omega = (180 / seg.spb) * D2R;             // rad/초
-  const speed = omega * TILE;                      // 접선 속도
+  const omega = (180 / seg.spb) * D2R;
+  const speed = omega * TILE;
   deadAnim = {
-    x: p.x, y: p.y, x0: p.x, y0: p.y,              // x0/y0 기준 해석적 이동 (주사율 무관)
+    x: p.x, y: p.y, x0: p.x, y0: p.y,
     vx: -Math.sin(a) * speed * seg.dir + Math.cos(a) * 40,
     vy:  Math.cos(a) * speed * seg.dir + Math.sin(a) * 40,
-    t0: now, red: R.idx % 2 === 1,                 // 공전 중인 쪽 색
+    t0: now, red: R.idx % 2 === 1,
   };
-  for (let i = 0; i < 10; i++) {                   // 폭발 입자
+  for (let i = 0; i < 10; i++) {
     const pa = Math.random() * TAU, sp = 40 + Math.random() * 130;
     parts.push({ x: p.x, y: p.y, vx: Math.cos(pa) * sp, vy: Math.sin(pa) * sp,
-                 t0: now, life: 0.7, color: deadAnim.red ? '#ff2d55' : '#00c2ff' });
+                 t0: now, life: 0.7, grav: 0, rect: false,
+                 color: deadAnim.red ? '#ff2d55' : '#00c2ff' });
   }
   popups.push({ txt: reason, color: '#ff5252', x: p.x, y: p.y, t0: now });
   R.stats.deaths++;
-  shake = 3;
+  R.combo = 0;
+  shake = 4;
   state = 'dead';
   stopMusic();
   musicBus.gain.setTargetAtTime(0, actx.currentTime, 0.12);
   playFail(actx.currentTime);
 }
 
-/* ===================== 8. 입력 처리 ===================== */
-// keydown 즉시 AudioContext.currentTime을 캡처해 판정 지연 최소화
+/* ===================== 9. 입력 처리 ===================== */
 const GAME_KEYS = new Set(['Space', 'KeyF', 'KeyJ']);
-let hotRects = []; // 이번 프레임의 클릭 가능 영역(버튼)
+let hotRects = [];
 
 window.addEventListener('keydown', (e) => {
   if (e.repeat) return;
@@ -606,7 +805,6 @@ canvas.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   const t = actx ? actx.currentTime : 0;
   // 버튼 히트 테스트 먼저 — resume은 가드된 unlockAudio로만
-  // (일시정지 중 '재개'를 눌렀을 때 카운트다운 전에 음악이 깨어나면 안 됨)
   for (const r of hotRects) {
     if (e.clientX >= r.x && e.clientX <= r.x + r.w &&
         e.clientY >= r.y && e.clientY <= r.y + r.h) {
@@ -618,11 +816,9 @@ canvas.addEventListener('pointerdown', (e) => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    // 탭 이탈·화면 잠금 시 자동 일시정지 (카운트다운 중이면 일시정지로 되돌림)
     if (state === 'play' || state === 'countdown') pauseGame();
-    if (unmuteEl) unmuteEl.pause();          // 백그라운드에서 무음 루프 정지
+    if (unmuteEl) unmuteEl.pause();
   } else {
-    // 복귀 시: OS가 끊은(interrupted) 컨텍스트 복구. 일시정지 상태는 유지.
     if (actx && actx.state === 'suspended' && state !== 'pause' && state !== 'countdown')
       actx.resume();
     if (unmuteEl && actx) unlockMedia();
@@ -651,9 +847,6 @@ function handleAction(code, t) {
       break;
     case 'select':
       if (code === 'Escape') { state = 'title'; break; }
-      if (code === 'Digit1' || code === 'Numpad1') startGame(0);
-      else if (code === 'Digit2' || code === 'Numpad2') startGame(1);
-      else if (code === 'Digit3' || code === 'Numpad3') startGame(2);
       break;
     case 'play':
       if (code === 'Escape') { pauseGame(); break; }
@@ -668,11 +861,10 @@ function handleAction(code, t) {
       if (code === 'KeyR' || code === 'Enter') startGame(levelIdx);
       else if (code === 'KeyL' || code === 'Escape') state = 'select';
       break;
-    // countdown / dead / clear 중에는 입력 무시
   }
 }
 
-/* ---- 보정 화면: 메트로놈 4비트에 8회 탭 → 평균 오차를 오프셋으로 ---- */
+/* ---- 보정 화면 ---- */
 function enterCalib() {
   state = 'calib';
   calib.taps.length = 0; calib.beatTimes.length = 0; calib.done = false;
@@ -682,7 +874,6 @@ function enterCalib() {
 }
 function calibTap(t) {
   if (calib.done) return;
-  // 가장 가까운 비트와의 오차 (앞뒤 ±0.3초 이내만 유효)
   let best = null;
   for (const bt of calib.beatTimes) {
     const err = t - bt;
@@ -704,65 +895,89 @@ function finishCalib(skipped) {
   state = 'select';
 }
 
-/* ===================== 9. 업데이트 (게임 로직 — 오디오 시계 기준) ===================== */
+/* ===================== 10. 업데이트 (오디오 시계 기준) ===================== */
 function update() {
   if (!actx) return;
   const now = actx.currentTime;
   if (state === 'play' && !R.finished) {
-    // 자동 미스: 목표각을 60도(=박자의 1/3) 지나치면 게임오버
     const seg = R.tiles[R.idx];
     const tArr = R.t0 + R.tiles[R.idx + 1].arrival;
     if (now - inputOffset > tArr + seg.spb / 3) die(now, '놓침');
   }
-  if (state === 'dead' && now - deadAnim.t0 > 1.0) {
-    startRun(R.li, true);                         // 1초 후 처음부터 재시작
-  }
-  if (state === 'clear' && now - clearT > 1.6) {
-    state = 'result';
-  }
+  if (state === 'dead' && now - deadAnim.t0 > 1.0) startRun(R.li, true);
+  if (state === 'clear' && now - clearT > 2.2) state = 'result';
   if (state === 'countdown' && performance.now() - countdownT0 > 1800) {
     state = 'play';
-    actx.resume();                                // 음악이 멈춘 지점에서 정확히 재개
+    actx.resume();
   }
 }
 
-/* ===================== 10. 렌더링 ===================== */
-let bgGrad = null, bgGradKey = '';
+/* ===================== 11. 렌더링 ===================== */
+function themeNow() { return R ? R.level.theme : THEMES.violet; }
+
 function drawBackground(pulse) {
-  // 어두운 남색-보라 대각 그라데이션 (#0a0a14 → #14101f)
-  const key = W + 'x' + H;
+  const th = themeNow();
+  const key = W + 'x' + H + th.bg[0];
   if (bgGradKey !== key) {
     bgGrad = ctx.createLinearGradient(0, 0, W, H);
-    bgGrad.addColorStop(0, '#0a0a14');
-    bgGrad.addColorStop(1, '#14101f');
+    bgGrad.addColorStop(0, th.bg[0]);
+    bgGrad.addColorStop(1, th.bg[1]);
     bgGradKey = key;
   }
   ctx.fillStyle = bgGrad;
   ctx.fillRect(0, 0, W, H);
-  // 별 입자: 느리게 떠다니며 미세하게 깜빡임
   const t = performance.now() / 1000;
+  // 놀이공원 장식: 대관람차 실루엣(점 12개 링) + 떠다니는 풍선 도형
+  drawParkDecor(t, th);
+  // 별 입자
   for (const s of stars) {
     s.x += 3 * s.z * 0.016;
     if (s.x > W + 4) s.x = -4;
     ctx.globalAlpha = 0.14 + 0.18 * (0.5 + 0.5 * Math.sin(t * 0.8 + s.tw));
-    ctx.fillStyle = '#cdd3ff';
+    ctx.fillStyle = th.star;
     ctx.beginPath();
     ctx.arc(s.x, s.y, s.r * s.z, 0, TAU);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
-  return pulse;
+}
+function drawParkDecor(t, th) {
+  // 대관람차: 오른쪽 아래에 크고 흐리게, 천천히 회전
+  const cx = W * 0.85, cy = H * 0.88, rr = Math.min(W, H) * 0.34;
+  ctx.globalAlpha = 0.05;
+  ctx.strokeStyle = th.accent;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(cx, cy, rr, 0, TAU); ctx.stroke();
+  for (let i = 0; i < 12; i++) {
+    const a = t * 0.08 + (i / 12) * TAU;
+    const px = cx + Math.cos(a) * rr, py = cy + Math.sin(a) * rr;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(px, py); ctx.stroke();
+    ctx.fillStyle = i % 2 ? th.accent : th.accent2;
+    ctx.globalAlpha = 0.09;
+    ctx.beginPath(); ctx.arc(px, py, 6, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 0.05;
+  }
+  // 풍선(원형 도형 3개) 왼쪽에서 두둥실
+  for (let i = 0; i < 3; i++) {
+    const bx = W * 0.12 + i * W * 0.07;
+    const by = H * (0.75 - 0.06 * i) + Math.sin(t * 0.4 + i * 2.1) * 14;
+    ctx.globalAlpha = 0.06;
+    ctx.fillStyle = i % 2 ? th.accent2 : th.accent;
+    ctx.beginPath(); ctx.arc(bx, by, 14 + i * 4, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
 }
 function drawVignette(pulse) {
-  ctx.globalAlpha = clamp(0.92 + 0.05 * pulse, 0, 1); // 비트 펄스 5% 이내
+  ctx.globalAlpha = clamp(0.92 + 0.05 * pulse, 0, 1);
   ctx.drawImage(vignetteCv, 0, 0, W, H);
   ctx.globalAlpha = 1;
 }
 
-/* ---- 트랙: 둥근 세그먼트 2패스(외곽 → 채움)로 꺾임 이음새를 자연스럽게 ---- */
-function drawTrack() {
+/* ---- 트랙 ---- */
+function drawTrack(now) {
+  const th = R.level.theme;
   const tiles = R.tiles;
-  const segLen = TILE + 14; // 양끝 7px 연장 → 꺾임 부분이 겹치며 이어짐
+  const segLen = TILE + 14;
   for (let pass = 0; pass < 2; pass++) {
     for (let i = 0; i < tiles.length - 1; i++) {
       const a = tiles[i], b = tiles[i + 1];
@@ -771,16 +986,40 @@ function drawTrack() {
       ctx.translate(cx, cy);
       ctx.rotate(a.out * D2R);
       ctx.beginPath();
-      if (pass === 0) { // 1px 밝은 테두리 역할 (한 겹 크게 채움)
-        ctx.fillStyle = '#4a4a5f';
+      if (pass === 0) {
+        ctx.fillStyle = th.edge;
         ctx.roundRect(-segLen / 2 - 1, -TILE_TH / 2 - 1, segLen + 2, TILE_TH + 2, 7);
-      } else {          // 본체 — 현재 진행 타일은 살짝 밝게
-        ctx.fillStyle = i === R.idx ? '#3a3a4e' : '#2a2a3a';
+        ctx.fill();
+      } else {
+        ctx.fillStyle = i === R.idx ? lightenCache(th.track, 16) :
+                        i < R.idx ? lightenCache(th.track, 7) : th.track;
         ctx.roundRect(-segLen / 2, -TILE_TH / 2, segLen, TILE_TH, 6);
+        ctx.fill();
+        // 착지 직후 타일 화이트 플래시 (0.3초)
+        const ft = R.flashT[i + 1];
+        if (now - ft < 0.3) {
+          ctx.globalAlpha = 0.5 * (1 - (now - ft) / 0.3);
+          ctx.fillStyle = '#ffffff';
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        }
       }
-      ctx.fill();
       ctx.restore();
     }
+  }
+  // 다음 목표 타일 예고 펄스 (액센트 색 테두리)
+  if (!R.finished && R.idx + 1 < tiles.length) {
+    const seg = tiles[R.idx];
+    const tArr = R.t0 + tiles[R.idx + 1].arrival;
+    const closeness = clamp(1 - (tArr - now) / (seg.beats * seg.spb), 0, 1);
+    const nt = tiles[R.idx + 1];
+    ctx.globalAlpha = 0.25 + 0.45 * closeness;
+    ctx.strokeStyle = th.accent;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(nt.x, nt.y, 17 - 4 * closeness, 0, TAU);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
   }
   // 특수 타일 아이콘 + 도착 지점 링
   for (let i = 1; i < tiles.length - 1; i++) {
@@ -789,13 +1028,22 @@ function drawTrack() {
     if (tl.speedMark !== undefined) drawSpeedIcon(tl.x, tl.y, tl.out, tl.speedMark);
   }
   const goal = tiles[tiles.length - 1];
-  ctx.strokeStyle = 'rgba(255,215,106,0.7)';
+  ctx.strokeStyle = th.accent;
+  ctx.globalAlpha = 0.8;
   ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(goal.x, goal.y, 9, 0, TAU);
-  ctx.stroke();
+  ctx.beginPath(); ctx.arc(goal.x, goal.y, 9, 0, TAU); ctx.stroke();
+  ctx.globalAlpha = 1;
 }
-function drawVortexIcon(x, y) { // 소용돌이: 나선
+// 색상 밝히기 캐시 (#rrggbb + n)
+const _lcache = {};
+function lightenCache(hex, n) {
+  const k = hex + n;
+  if (_lcache[k]) return _lcache[k];
+  const v = '#' + [1, 3, 5].map(i =>
+    clamp(parseInt(hex.slice(i, i + 2), 16) + n, 0, 255).toString(16).padStart(2, '0')).join('');
+  return (_lcache[k] = v);
+}
+function drawVortexIcon(x, y) {
   ctx.save();
   ctx.translate(x, y);
   ctx.strokeStyle = '#c07aff'; ctx.lineWidth = 2; ctx.lineCap = 'round';
@@ -808,7 +1056,7 @@ function drawVortexIcon(x, y) { // 소용돌이: 나선
   ctx.stroke();
   ctx.restore();
 }
-function drawSpeedIcon(x, y, ang, mult) { // 속도: 셰브런 (빠름 », 느림 «, 복귀 ·)
+function drawSpeedIcon(x, y, ang, mult) {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(ang * D2R);
@@ -820,25 +1068,26 @@ function drawSpeedIcon(x, y, ang, mult) { // 속도: 셰브런 (빠름 », 느�
   };
   if (mult > 1)      { ctx.strokeStyle = '#ffb069'; chev(-4, 1); chev(3, 1); }
   else if (mult < 1) { ctx.strokeStyle = '#7ad7ff'; chev(0, -1); }
-  else { // 원속 복귀 표시
+  else {
     ctx.strokeStyle = '#9a9ab0';
     ctx.beginPath(); ctx.arc(0, 0, 4, 0, TAU); ctx.stroke();
   }
   ctx.restore();
 }
 
-/* ---- 행성: radial gradient + glow, 공전 행성 잔상 트레일 ---- */
-function drawPlanet(x, y, red, glow, alpha) {
+/* ---- 행성 (착지 순간 팝: 반지름이 커졌다 돌아옴) ---- */
+function drawPlanet(x, y, red, glow, alpha, pop) {
+  const r = 14 * (1 + (pop || 0) * 0.32);
   ctx.save();
   ctx.globalAlpha = alpha;
   ctx.shadowColor = red ? '#ff2d55' : '#00c2ff';
   ctx.shadowBlur = 20 * glow;
-  const g = ctx.createRadialGradient(x - 4, y - 4, 2, x, y, 14);
+  const g = ctx.createRadialGradient(x - 4, y - 4, 2, x, y, r);
   if (red) { g.addColorStop(0, '#ffd9e0'); g.addColorStop(0.45, '#ff2d55'); g.addColorStop(1, '#a51236'); }
   else     { g.addColorStop(0, '#d9f7ff'); g.addColorStop(0.45, '#00c2ff'); g.addColorStop(1, '#00688f'); }
   ctx.fillStyle = g;
   ctx.beginPath();
-  ctx.arc(x, y, 14, 0, TAU);
+  ctx.arc(x, y, r, 0, TAU);
   ctx.fill();
   ctx.restore();
 }
@@ -854,31 +1103,56 @@ function drawTrail(red) {
   ctx.globalAlpha = 1;
 }
 
-/* ---- 이펙트: 판정 팝업 / 충격파 링 / 입자 ---- */
+/* ---- 이펙트 ---- */
 function drawEffects(now) {
-  // 충격파: 0.3초간 링 확장
-  shocks = shocks.filter(s => now - s.t0 < 0.3);
+  // 충격파 (이중 링)
+  shocks = shocks.filter(s => now - s.t0 < 0.32 && now >= s.t0);
   for (const s of shocks) {
-    const k = (now - s.t0) / 0.3;
-    ctx.globalAlpha = 0.55 * (1 - k);
-    ctx.strokeStyle = '#e8e8ff';
-    ctx.lineWidth = 2.5 * (1 - k) + 0.5;
+    const k = (now - s.t0) / 0.32;
+    ctx.globalAlpha = 0.6 * (1 - k);
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 3 * (1 - k) + 0.5;
     ctx.beginPath();
-    ctx.arc(s.x, s.y, 8 + 38 * easeOutCubic(k), 0, TAU);
+    ctx.arc(s.x, s.y, 8 + 46 * easeOutCubic(k), 0, TAU);
     ctx.stroke();
   }
-  // 입자
+  // 광선 버스트 (콤보 마일스톤)
+  rays = rays.filter(r => now - r.t0 < 0.55);
+  for (const r of rays) {
+    const k = (now - r.t0) / 0.55;
+    ctx.globalAlpha = 0.5 * (1 - k);
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * TAU + k * 0.9;
+      const r1 = 20 + 90 * easeOutCubic(k), r2 = r1 + 26 * (1 - k);
+      ctx.beginPath();
+      ctx.moveTo(r.x + Math.cos(a) * r1, r.y + Math.sin(a) * r1);
+      ctx.lineTo(r.x + Math.cos(a) * r2, r.y + Math.sin(a) * r2);
+      ctx.stroke();
+    }
+  }
+  // 입자/콘페티 (중력 + 회전 사각 조각)
   parts = parts.filter(p => now - p.t0 < p.life);
   for (const p of parts) {
-    const k = (now - p.t0) / p.life;
+    const dt = now - p.t0, k = dt / p.life;
+    const px = p.x + p.vx * dt, py = p.y + p.vy * dt + 0.5 * (p.grav || 0) * dt * dt;
     ctx.globalAlpha = 1 - k;
     ctx.fillStyle = p.color;
-    ctx.beginPath();
-    ctx.arc(p.x + p.vx * (now - p.t0), p.y + p.vy * (now - p.t0), 2.5 * (1 - k) + 0.5, 0, TAU);
-    ctx.fill();
+    if (p.rect) {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate((p.rot || 0) + dt * 7);
+      ctx.fillRect(-2.6, -1.6, 5.2, 3.2);
+      ctx.restore();
+    } else {
+      ctx.beginPath();
+      ctx.arc(px, py, 2.5 * (1 - k) + 0.5, 0, TAU);
+      ctx.fill();
+    }
   }
   ctx.globalAlpha = 1;
-  // 판정 팝업: 작게 시작 → 커지며 떠오르고 페이드아웃 (0.5초, cubic ease-out)
+  // 판정 팝업
   popups = popups.filter(p => now - p.t0 < 0.5);
   for (const p of popups) {
     const k = (now - p.t0) / 0.5, e = easeOutCubic(k);
@@ -894,8 +1168,9 @@ function drawEffects(now) {
   }
 }
 
-/* ---- HUD: 정확도 / 진행도 / 히트 에러 바 ---- */
+/* ---- HUD ---- */
 function drawHUD(now) {
+  const th = R.level.theme;
   const s = R.stats;
   const acc = s.inputs ? (s.weight / s.inputs) * 100 : 100;
   ctx.font = "500 15px 'Segoe UI','Pretendard',sans-serif";
@@ -903,10 +1178,19 @@ function drawHUD(now) {
   ctx.fillStyle = 'rgba(230,230,245,0.85)';
   ctx.textAlign = 'left';
   ctx.fillText(`정확도 ${acc.toFixed(1)}%`, 18, 16);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(220,220,240,0.6)';
+  ctx.fillText(R.level.name, W / 2, 16);
   ctx.textAlign = 'right';
   const prog = (R.idx / (R.tiles.length - 1)) * 100;
+  ctx.fillStyle = 'rgba(230,230,245,0.85)';
   ctx.fillText(`진행 ${prog.toFixed(0)}%`, W - 66, 24);
-  // 일시정지 버튼 (우상단) — 모바일에서 ESC 대체. 플레이 중에만 활성.
+  if (s.deaths > 0) {
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(255,120,120,0.7)';
+    ctx.fillText(`재시도 ${s.deaths}`, 18, 38);
+  }
+  // 일시정지 버튼
   if (state === 'play') {
     const pb = { x: W - 54, y: 10, w: 44, h: 44 };
     ctx.fillStyle = 'rgba(255,255,255,0.05)';
@@ -919,16 +1203,27 @@ function drawHUD(now) {
     hotRects.push({ ...pb, label: '일시정지',
                     cb: () => { if (state === 'play') pauseGame(); } });
   }
-  if (s.deaths > 0) {
-    ctx.textAlign = 'left';
-    ctx.fillStyle = 'rgba(255,120,120,0.7)';
-    ctx.fillText(`재시도 ${s.deaths}`, 18, 38);
+  // 콤보 카운터 (증가 순간 팝)
+  if (R.combo >= 2) {
+    const popK = clamp((now - comboPopT) / 0.18, 0, 1);
+    const sc = 1 + 0.35 * (1 - easeOutCubic(popK));
+    ctx.save();
+    ctx.translate(W / 2, H - 92);
+    ctx.scale(sc, sc);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = th.accent;
+    ctx.font = "700 26px 'Segoe UI','Pretendard',sans-serif";
+    ctx.fillText(String(R.combo), 0, 0);
+    ctx.fillStyle = 'rgba(220,220,240,0.5)';
+    ctx.font = "500 11px 'Segoe UI','Pretendard',sans-serif";
+    ctx.fillText('COMBO', 0, 21);
+    ctx.restore();
   }
-  // 히트 에러 바: 중앙 = 완벽, ±60도 범위
+  // 히트 에러 바
   const bw = Math.min(320, W * 0.6), bh = 6, bx = W / 2 - bw / 2, by = H - 42;
   ctx.fillStyle = 'rgba(255,255,255,0.08)';
   ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 3); ctx.fill();
-  ctx.fillStyle = 'rgba(255,215,106,0.22)'; // 완벽 존 (±25/60)
+  ctx.fillStyle = 'rgba(255,215,106,0.22)';
   const pz = bw * (25 / 60) / 2;
   ctx.fillRect(W / 2 - pz, by, pz * 2, bh);
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
@@ -942,7 +1237,6 @@ function drawHUD(now) {
     ctx.fillRect(x - 1, by - 5, 2, bh + 10);
   }
   ctx.globalAlpha = 1;
-  // 인트로 힌트
   if (R.idx === 0 && !R.finished) {
     ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(220,220,240,0.55)';
@@ -952,7 +1246,7 @@ function drawHUD(now) {
   }
 }
 
-/* ---- 자간 있는 대문자 타이틀 텍스트 (canvas letterSpacing 미지원 대비 수동 구현) ---- */
+/* ---- 자간 타이틀 텍스트 ---- */
 function drawSpacedText(txt, x, y, font, spacingEm, color) {
   ctx.font = font;
   ctx.textBaseline = 'middle';
@@ -970,50 +1264,51 @@ function drawSpacedText(txt, x, y, font, spacingEm, color) {
   }
 }
 
-/* ---- 화면: 버튼 헬퍼 ---- */
-function button(x, y, w, h, label, cb, sub) {
+/* ---- 버튼 ---- */
+function button(x, y, w, h, label, cb, sub, opts) {
+  const o = opts || {};
   ctx.save();
-  ctx.strokeStyle = 'rgba(160,160,190,0.45)';
-  ctx.lineWidth = 1;
-  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  ctx.strokeStyle = o.stroke || 'rgba(160,160,190,0.45)';
+  ctx.lineWidth = o.lineWidth || 1;
+  ctx.fillStyle = o.fill || 'rgba(255,255,255,0.04)';
   ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.fill(); ctx.stroke();
-  ctx.fillStyle = 'rgba(235,235,250,0.92)';
-  ctx.font = "600 17px 'Segoe UI','Pretendard',sans-serif";
+  ctx.fillStyle = o.color || 'rgba(235,235,250,0.92)';
+  ctx.font = o.font || "600 17px 'Segoe UI','Pretendard',sans-serif";
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(label, x + w / 2, y + h / 2 - (sub ? 10 : 0));
   if (sub) {
     ctx.fillStyle = 'rgba(180,180,205,0.65)';
-    ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
+    ctx.font = "400 12px 'Segoe UI','Pretendard',sans-serif";
     ctx.fillText(sub, x + w / 2, y + h / 2 + 13);
   }
   ctx.restore();
   hotRects.push({ x, y, w, h, cb, label });
 }
 
-/* ---- 각 화면 렌더링 ---- */
+/* ---- 화면들 ---- */
 function drawTitle() {
   drawBackground(0);
   const t = performance.now() / 1000;
-  // 장식: 서로 공전하는 두 행성
   const cx = W / 2, cy = H / 2 - 110, r = 42;
   const a = t * 1.4;
-  drawPlanet(cx + Math.cos(a) * r, cy + Math.sin(a) * r, true, 1, 1);
-  drawPlanet(cx - Math.cos(a) * r, cy - Math.sin(a) * r, false, 1, 1);
-  const ts = Math.round(Math.min(44, W * 0.095)); // 좁은 화면에서 제목이 넘치지 않게
+  drawPlanet(cx + Math.cos(a) * r, cy + Math.sin(a) * r, true, 1, 1, 0);
+  drawPlanet(cx - Math.cos(a) * r, cy - Math.sin(a) * r, false, 1, 1, 0);
+  const ts = Math.round(Math.min(44, W * 0.095));
   drawSpacedText('ORBIT BEAT', W / 2, H / 2 + 10,
                  `700 ${ts}px 'Segoe UI','Pretendard',sans-serif`, 0.3, '#e9e9f7');
-  // 시작 안내 — sine ease 깜빡임
+  ctx.globalAlpha = 0.7;
+  ctx.fillStyle = '#b9a9d4';
+  ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('리듬 놀이공원', W / 2, H / 2 + 46);
   ctx.globalAlpha = 0.35 + 0.45 * (0.5 + 0.5 * Math.sin(t * 2.2));
   ctx.fillStyle = '#b9b9d4';
   ctx.font = "400 16px 'Segoe UI','Pretendard',sans-serif";
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(IS_TOUCH ? '화면을 탭해 시작' : '아무 키나 눌러 시작', W / 2, H / 2 + 74);
+  ctx.fillText(IS_TOUCH ? '화면을 탭해 시작' : '아무 키나 눌러 시작', W / 2, H / 2 + 84);
   ctx.globalAlpha = 1;
   drawAudioHint();
   drawVignette(0);
 }
-
-// 오디오가 아직 활성화되지 않았으면 하단에 안내 (탭할 때마다 재시도됨)
 function drawAudioHint() {
   if (!actx || actx.state === 'running') return;
   ctx.fillStyle = 'rgba(255,215,106,0.75)';
@@ -1036,7 +1331,6 @@ function drawCalib() {
     ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
     ctx.fillText('ESC — 건너뛰기', W / 2, H * 0.32 + 26);
   }
-  // 비트 펄스 원
   let pulse = 0;
   for (const bt of calib.beatTimes) {
     const d = now - bt;
@@ -1047,7 +1341,6 @@ function drawCalib() {
   ctx.beginPath(); ctx.arc(W / 2, H / 2 + 10, 26 + pulse * 10, 0, TAU); ctx.stroke();
   ctx.fillStyle = `rgba(122,215,255,${0.15 + pulse * 0.5})`;
   ctx.beginPath(); ctx.arc(W / 2, H / 2 + 10, 18, 0, TAU); ctx.fill();
-  // 탭 진행 점
   for (let i = 0; i < 8; i++) {
     ctx.fillStyle = i < calib.taps.length ? '#ffd76a' : 'rgba(255,255,255,0.15)';
     ctx.beginPath();
@@ -1061,98 +1354,197 @@ function drawCalib() {
     button(W / 2 - 80, H / 2 + 146, 160, 44, IS_TOUCH ? '완료' : '완료 (Enter)',
            () => finishCalib(false));
   } else {
-    // 탭으로 건너뛰기 (모바일에서 ESC 대체) — 탭 판정 영역과 겹치지 않게 하단 배치
     button(W / 2 - 80, H - 92, 160, 44, '건너뛰기', () => finishCalib(true));
   }
   drawVignette(0);
 }
 
+/* ---- 레벨 선택: 탭(초급/중급/고급) + 그리드 ---- */
 function drawSelect() {
   drawBackground(0);
-  const hs = Math.round(Math.min(26, W * 0.06));
-  drawSpacedText('LEVEL SELECT', W / 2, H * 0.16,
+  const hs = Math.round(Math.min(24, W * 0.055));
+  drawSpacedText('LEVEL SELECT', W / 2, Math.max(34, H * 0.08),
                  `700 ${hs}px 'Segoe UI','Pretendard',sans-serif`, 0.3, '#e9e9f7');
-  // 카드 크기를 화면 높이에 맞춰 조정 (가로 모드 폰에서도 3개가 들어가게)
-  const cw = Math.min(420, W - 60);
-  const ch = Math.min(74, H * 0.115), gap = Math.min(18, H * 0.028);
-  const y0 = H * 0.26;
-  LEVELS.forEach((lv, i) => {
-    const y = y0 + i * (ch + gap);
-    button(W / 2 - cw / 2, y, cw, ch, `${i + 1}. ${lv.name}`,
-           () => startGame(i), `${lv.sub} · ${lv.bpm} BPM`);
-    if (grades[i]) {
-      ctx.fillStyle = { S: '#ffd76a', A: '#7ad7ff', B: '#9effa0', C: '#a8a8b8' }[grades[i]];
-      ctx.font = "700 24px 'Segoe UI','Pretendard',sans-serif";
-      ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
-      ctx.fillText(grades[i], W / 2 + cw / 2 - 22, y + ch / 2);
+  // 난이도 탭
+  const tabW = Math.min(110, (W - 60) / 3), tabH = 40;
+  const tabsX = W / 2 - (tabW * 3 + 20) / 2;
+  const tabY = Math.max(62, H * 0.13);
+  TIERS.forEach((tier, i) => {
+    const x = tabsX + i * (tabW + 10);
+    const active = selTab === i;
+    button(x, tabY, tabW, tabH, tier.name, () => { selTab = i; }, null, {
+      fill: active ? 'rgba(255,255,255,0.1)' : 'rgba(255,255,255,0.03)',
+      stroke: active ? tier.color : 'rgba(160,160,190,0.3)',
+      color: active ? tier.color : 'rgba(200,200,220,0.6)',
+      lineWidth: active ? 1.5 : 1,
+    });
+  });
+  // 현재 탭의 맵 그리드
+  const list = [];
+  LEVELS.forEach((lv, id) => { if (lv.tier === selTab) list.push({ lv, id }); });
+  const gy0 = tabY + tabH + 16;
+  const availH = H - gy0 - 30;
+  const cols = W >= 900 ? 5 : W >= 620 ? 4 : W >= 400 ? 3 : 2;
+  const rows = Math.ceil(list.length / cols);
+  const gap = 10;
+  const cardW = Math.min(170, (Math.min(W - 32, cols * 180) - (cols - 1) * gap) / cols);
+  const cardH = clamp((availH - (rows - 1) * gap) / rows, 44, 78);
+  const gridW = cols * cardW + (cols - 1) * gap;
+  const gx0 = W / 2 - gridW / 2;
+  list.forEach((item, i) => {
+    const cx = gx0 + (i % cols) * (cardW + gap);
+    const cy = gy0 + Math.floor(i / cols) * (cardH + gap);
+    const num = i + 1;
+    const g = grades[item.id];
+    button(cx, cy, cardW, cardH, `${num}. ${item.lv.name}`,
+           () => startGame(item.id),
+           cardH >= 58 ? `${item.lv.bpm} BPM` : null, {
+             font: `600 ${cardW < 120 ? 12 : 14}px 'Segoe UI','Pretendard',sans-serif`,
+             stroke: g ? item.lv.theme.accent : 'rgba(160,160,190,0.35)',
+           });
+    if (g) {
+      ctx.fillStyle = { S: '#ffd76a', A: '#7ad7ff', B: '#9effa0', C: '#a8a8b8' }[g];
+      ctx.font = "700 13px 'Segoe UI','Pretendard',sans-serif";
+      ctx.textAlign = 'right'; ctx.textBaseline = 'top';
+      ctx.fillText(g, cx + cardW - 7, cy + 5);
     }
   });
-  ctx.fillStyle = 'rgba(160,160,185,0.55)';
-  ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(IS_TOUCH ? '레벨을 탭하세요' : '숫자 키 또는 클릭 · ESC — 타이틀',
-               W / 2, y0 + 3 * (ch + gap) + 16);
-  button(14, 14, 92, 38, '타이틀', () => { state = 'title'; });
+  button(14, 14, 82, 36, '타이틀', () => { state = 'title'; },
+         null, { font: "500 14px 'Segoe UI','Pretendard',sans-serif" });
   drawAudioHint();
   drawVignette(0);
 }
 
+/* ---- 플레이 화면 ---- */
 function drawPlay() {
   const now = actx.currentTime;
+  const th = R.level.theme;
   const seg = R.tiles[Math.min(R.idx, R.tiles.length - 2)];
-  // 비트 펄스: 박자 시작에서 튀고 감쇠 (5% 이내로 절제)
   const segT0 = R.t0 + R.tiles[R.idx].arrival;
   const frac = mod360(((now - segT0) / seg.spb) * 360) / 360 % 1;
   const pulse = Math.pow(1 - (frac % 1), 2);
   drawBackground(pulse);
 
-  // ---- 카메라: 두 행성 중간점을 lerp 0.08로 추적, 줌은 천천히 숨쉬듯 ----
+  // 카메라: lerp 추적 + 숨쉬는 줌 + 착지 줌 펀치 + (고급) 회전
   const fixedTl = R.tiles[R.idx];
   const op = state === 'dead' ? { x: deadAnim.x, y: deadAnim.y }
            : R.finished ? R.tiles[R.tiles.length - 2]
            : orbitPos(now);
-  const tx = (fixedTl.x + op.x) / 2, ty = (fixedTl.y + op.y) / 2;
-  cam.x = lerp(cam.x, tx, 0.08);
-  cam.y = lerp(cam.y, ty, 0.08);
+  cam.x = lerp(cam.x, (fixedTl.x + op.x) / 2, 0.08);
+  cam.y = lerp(cam.y, (fixedTl.y + op.y) / 2, 0.08);
   const breathe = 1 + 0.08 * Math.sin((now - R.t0) * 0.33);
-  const scale = clamp(Math.min(W, H) / 760, 0.55, 1.15) * breathe;
+  zoomKick *= 0.88;
+  rotKick *= 0.92;
+  const scale = clamp(Math.min(W, H) / 760, 0.55, 1.15) * breathe * (1 + zoomKick);
+  const camRot = (R.level.tier === 2 ? 4 * Math.sin((now - R.t0) * 0.2) : 0) + rotKick;
   shake *= 0.86;
   const shx = (Math.random() * 2 - 1) * shake, shy = (Math.random() * 2 - 1) * shake;
 
   ctx.save();
   ctx.translate(W / 2 + shx, H / 2 + shy);
+  ctx.rotate(camRot * D2R);
   ctx.scale(scale, scale);
   ctx.translate(-cam.x, -cam.y);
 
-  drawTrack();
+  drawTrack(now);
   drawEffects(now);
 
-  // ---- 행성: 짝수 idx = 빨강 고정 / 홀수 idx = 파랑 고정 (착지마다 교대) ----
   const redFixed = R.idx % 2 === 0;
   const glow = 1 + 0.05 * pulse;
+  const pop = Math.max(0, 1 - (now - planetPopT) / 0.14);
   if (state === 'dead') {
-    // 죽은 행성: 접선 방향으로 날아가며 페이드아웃 (시간 기반 — 120Hz에서도 동일 속도)
     const dt = now - deadAnim.t0;
     deadAnim.x = deadAnim.x0 + deadAnim.vx * dt;
     deadAnim.y = deadAnim.y0 + deadAnim.vy * dt;
-    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1);
-    drawPlanet(deadAnim.x, deadAnim.y, deadAnim.red, glow, clamp(1 - dt / 0.9, 0, 1));
+    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1, 0);
+    drawPlanet(deadAnim.x, deadAnim.y, deadAnim.red, glow, clamp(1 - dt / 0.9, 0, 1), 0);
   } else if (R.finished) {
     const prev = R.tiles[R.tiles.length - 2];
-    drawPlanet(prev.x, prev.y, !redFixed, glow, 1);
-    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1);
+    drawPlanet(prev.x, prev.y, !redFixed, glow, 1, 0);
+    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1, pop);
   } else {
-    // 잔상 트레일 12프레임 (알파 점감)
     trail.push({ x: op.x, y: op.y });
     if (trail.length > 12) trail.shift();
     drawTrail(!redFixed);
-    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1);
-    drawPlanet(op.x, op.y, !redFixed, glow, 1);
+    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1, pop);
+    drawPlanet(op.x, op.y, !redFixed, glow, 1, 0);
   }
   ctx.restore();
 
+  // 다운비트 화면 플래시 (은은한 액센트 색)
+  const fk = (now - flashAt) / 0.3;
+  if (fk >= 0 && fk < 1) {
+    ctx.globalAlpha = 0.05 * (1 - fk);
+    ctx.fillStyle = th.accent;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+  // 4마디 광선 (화면 모서리에서 은은하게)
+  const rk = (now - rayAt) / 0.6;
+  if (rk >= 0 && rk < 1) {
+    ctx.globalAlpha = 0.08 * (1 - rk);
+    ctx.strokeStyle = th.accent2;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * TAU + rk;
+      ctx.beginPath();
+      ctx.moveTo(W / 2 + Math.cos(a) * W * 0.32, H / 2 + Math.sin(a) * W * 0.32);
+      ctx.lineTo(W / 2 + Math.cos(a) * W * 0.6, H / 2 + Math.sin(a) * W * 0.6);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  // 배속 구간 스피드라인
+  if (seg.bpm > R.level.bpm * 1.15 && state === 'play') {
+    ctx.globalAlpha = 0.1;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    for (let i = 0; i < 10; i++) {
+      const a = (i / 10) * TAU + now * 2.4;
+      const r1 = Math.min(W, H) * 0.42, r2 = r1 + 40 + 24 * Math.sin(now * 9 + i);
+      ctx.beginPath();
+      ctx.moveTo(W / 2 + Math.cos(a) * r1, H / 2 + Math.sin(a) * r1);
+      ctx.lineTo(W / 2 + Math.cos(a) * r2, H / 2 + Math.sin(a) * r2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
   drawVignette(pulse);
   drawHUD(now);
+  if (state === 'clear') drawClearOverlay(now);
+}
+
+/* ---- 클리어: 불꽃놀이 + CLEAR ---- */
+let lastFw = -9;
+function drawClearOverlay(now) {
+  const th = R.level.theme;
+  const el = now - clearT;
+  // 0.25초 간격 불꽃 버스트 (파티클 시스템 재사용)
+  if (now - lastFw > 0.25 && el < 1.8) {
+    lastFw = now;
+    const fx = R.tiles[R.tiles.length - 1].x + (Math.random() - 0.5) * 260;
+    const fy = R.tiles[R.tiles.length - 1].y - 60 - Math.random() * 140;
+    const col = [th.accent, th.accent2, '#ffffff'][Math.floor(Math.random() * 3)];
+    for (let i = 0; i < 14; i++) {
+      const a = (i / 14) * TAU, sp = 60 + Math.random() * 110;
+      parts.push({ x: fx, y: fy, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+                   t0: now, life: 0.8, grav: 90, rect: Math.random() < 0.4,
+                   rot: Math.random() * TAU, color: col });
+    }
+  }
+  if (el > 0.4) {
+    const k = clamp((el - 0.4) / 0.4, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = k;
+    ctx.translate(W / 2, H * 0.4);
+    ctx.scale(0.8 + 0.2 * easeOutCubic(k), 0.8 + 0.2 * easeOutCubic(k));
+    ctx.shadowColor = th.accent; ctx.shadowBlur = 24;
+    drawSpacedText('CLEAR!', 0, 0,
+                   `700 ${Math.round(Math.min(52, W * 0.11))}px 'Segoe UI','Pretendard',sans-serif`,
+                   0.22, '#ffffff');
+    ctx.restore();
+  }
 }
 
 function drawPauseOverlay() {
@@ -1190,23 +1582,28 @@ function drawCountdownOverlay() {
 
 function drawResult() {
   drawBackground(0);
+  const th = R.level.theme;
   const s = R.stats;
   const hs = Math.round(Math.min(28, W * 0.065));
-  drawSpacedText('RESULT', W / 2, H * 0.14,
+  drawSpacedText('RESULT', W / 2, H * 0.1,
                  `700 ${hs}px 'Segoe UI','Pretendard',sans-serif`, 0.3, '#e9e9f7');
-  // 등급
+  ctx.fillStyle = 'rgba(210,210,230,0.7)';
+  ctx.font = "500 15px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(`${TIERS[R.level.tier].name} · ${R.level.name}`, W / 2, H * 0.17);
   const gc = { S: '#ffd76a', A: '#7ad7ff', B: '#9effa0', C: '#a8a8b8' }[s.grade];
   ctx.save();
   ctx.shadowColor = gc; ctx.shadowBlur = 26;
   ctx.fillStyle = gc;
-  ctx.font = "700 88px 'Segoe UI','Pretendard',sans-serif";
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = "700 84px 'Segoe UI','Pretendard',sans-serif";
   ctx.fillText(s.grade, W / 2, H * 0.32);
   ctx.restore();
   ctx.fillStyle = 'rgba(235,235,250,0.9)';
   ctx.font = "500 18px 'Segoe UI','Pretendard',sans-serif";
-  ctx.fillText(`정확도 ${s.acc.toFixed(1)}%`, W / 2, H * 0.45);
-  // 판정별 카운트
+  ctx.fillText(`정확도 ${s.acc.toFixed(1)}%`, W / 2, H * 0.44);
+  ctx.fillStyle = th.accent;
+  ctx.font = "500 15px 'Segoe UI','Pretendard',sans-serif";
+  ctx.fillText(`최대 콤보 ${R.maxCombo}`, W / 2, H * 0.49);
   const rows = [
     ['완벽', s.perfect, '#ffd76a'],
     ['살짝 빠름 / 느림', s.early + s.late, '#7ad7ff'],
@@ -1215,21 +1612,21 @@ function drawResult() {
   ];
   ctx.font = "400 15px 'Segoe UI','Pretendard',sans-serif";
   rows.forEach((r, i) => {
-    const y = H * 0.53 + i * 26;
+    const y = H * 0.56 + i * 25;
     ctx.textAlign = 'right'; ctx.fillStyle = 'rgba(190,190,210,0.85)';
     ctx.fillText(r[0], W / 2 + 30, y);
     ctx.textAlign = 'left'; ctx.fillStyle = r[2];
     ctx.fillText(String(r[1]), W / 2 + 48, y);
   });
   const bw = Math.min(160, W / 2 - 25);
-  button(W / 2 - bw - 10, H * 0.78, bw, 46, IS_TOUCH ? '다시하기' : '다시하기 (R)',
+  button(W / 2 - bw - 10, H * 0.79, bw, 46, IS_TOUCH ? '다시하기' : '다시하기 (R)',
          () => startGame(levelIdx));
-  button(W / 2 + 10, H * 0.78, bw, 46, IS_TOUCH ? '레벨 선택' : '레벨 선택 (L)',
+  button(W / 2 + 10, H * 0.79, bw, 46, IS_TOUCH ? '레벨 선택' : '레벨 선택 (L)',
          () => { state = 'select'; });
   drawVignette(0);
 }
 
-/* ===================== 11. 메인 루프 (rAF — 렌더링 전용) ===================== */
+/* ===================== 12. 메인 루프 (rAF — 렌더링 전용) ===================== */
 function frame() {
   update();
   hotRects = [];
@@ -1248,19 +1645,20 @@ function frame() {
 }
 requestAnimationFrame(frame);
 
-/* ===================== 12. 테스트 훅 (자동 검증용 — 게임 동작에는 무관) ===================== */
+/* ===================== 13. 테스트 훅 (자동 검증용) ===================== */
 window.__OB = {
-  buildTiming, LEVELS, INTRO_BEATS, mod360,
+  buildTiming, buildMap, LEVELS, TIERS, INTRO_BEATS, mod360,
   get state() { return state; },
   get run() { return R; },
   get audioTime() { return actx ? actx.currentTime : -1; },
   get audioState() { return actx ? actx.state : 'none'; },
   get calib() { return calib; },
   get offset() { return inputOffset; },
+  get hotRects() { return hotRects; },
   press() { const t = actx ? actx.currentTime : 0; gamePress(t); },
   boot() { ensureAudio(); calibDone = true; state = 'select'; },
   start(i) { ensureAudio(); calibDone = true; startGame(i); },
-  get hotRects() { return hotRects; },
+  setTab(i) { selTab = i; },
 };
 </script>
 </body>
