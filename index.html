@@ -1,0 +1,1143 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>ORBIT BEAT</title>
+<style>
+  /* 전체 화면 캔버스 — 스크롤/터치 제스처 차단 */
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden;
+               background:#0a0a14; touch-action:none;
+               -webkit-user-select:none; user-select:none; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* ============================================================
+ * ORBIT BEAT — 원버튼 궤도 리듬게임
+ * 단일 파일 · Canvas 2D · Web Audio 합성 (외부 에셋 없음)
+ *
+ * 핵심 규칙:
+ *  - 두 행성 중 하나는 타일에 고정, 다른 하나가 공전 (1비트 = 180도)
+ *  - 타일 n에 착지한 순간 공전 시작각 = (이전 타일 방향 + 180도),
+ *    목표각 = 타일 n의 진행 방향. 공전 방향으로 남은 각도 Δ가
+ *    그 타일의 박자 길이(Δ/180 비트)를 결정한다.
+ *  - 시간 기준은 전부 AudioContext.currentTime (rAF는 렌더링 전용)
+ * ============================================================ */
+
+/* ===================== 1. 공용 유틸 ===================== */
+const TAU = Math.PI * 2, D2R = Math.PI / 180;
+const mod360 = a => ((a % 360) + 360) % 360;          // 0~360 정규화
+const clamp  = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp   = (a, b, k) => a + (b - a) * k;
+const rep    = (v, n) => Array(n).fill(v);
+const easeOutCubic = x => 1 - Math.pow(1 - x, 3);
+const noteFreq = semi => 440 * Math.pow(2, semi / 12); // A4 기준 반음 → 주파수
+
+/* ===================== 2. 캔버스 / 리사이즈 ===================== */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+let vignetteCv = null;   // 비네트 캐시 (리사이즈 때만 재생성)
+let stars = [];          // 배경 별 입자 40개
+
+// roundRect 폴리필 (구형 브라우저 대비)
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    this.moveTo(x + r, y);
+    this.arcTo(x + w, y, x + w, y + h, r);
+    this.arcTo(x + w, y + h, x, y + h, r);
+    this.arcTo(x, y + h, x, y, r);
+    this.arcTo(x, y, x + w, y, r);
+    this.closePath();
+    return this;
+  };
+}
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // 비네트: 중앙 투명 → 가장자리 어둡게 (radial gradient 캐시)
+  vignetteCv = document.createElement('canvas');
+  vignetteCv.width = W; vignetteCv.height = H;
+  const vc = vignetteCv.getContext('2d');
+  const g = vc.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.32,
+                                    W / 2, H / 2, Math.max(W, H) * 0.72);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.55)');
+  vc.fillStyle = g; vc.fillRect(0, 0, W, H);
+  // 별 입자 재배치
+  stars = [];
+  for (let i = 0; i < 40; i++) {
+    stars.push({ x: Math.random() * W, y: Math.random() * H,
+                 r: 0.6 + Math.random() * 1.4, z: 0.3 + Math.random() * 0.7,
+                 tw: Math.random() * TAU });
+  }
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ===================== 3. 오디오 엔진 (전부 합성) ===================== */
+let actx = null;                 // AudioContext — 첫 사용자 입력 시 생성
+let master, musicBus, sfxBus;    // 버스: 음악 / 효과음 분리
+let noiseBuf = null;             // 화이트노이즈 버퍼 (하이햇·클랩·타격음용)
+let inputOffset = 0;             // 보정 화면에서 측정한 입력 오프셋(초). 변수로만 보관.
+
+// 룩어헤드 스케줄러 상태 — 25ms 간격으로 깨어나 100ms 앞까지 예약
+const LOOKAHEAD = 0.1, TICK_MS = 25;
+const music = { mode: 'off', step: 0, nextTime: 0, t0: 0,
+                baseBpm: 100, timeline: [] }; // timeline: [{rel, bpm}] BPM 변화 시점
+
+function ensureAudio() {
+  if (actx) { actx.resume(); return; }
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  master = actx.createGain(); master.gain.value = 0.85;
+  const comp = actx.createDynamicsCompressor();
+  master.connect(comp); comp.connect(actx.destination);
+  musicBus = actx.createGain(); musicBus.gain.value = 0.72; musicBus.connect(master);
+  sfxBus = actx.createGain(); sfxBus.gain.value = 1; sfxBus.connect(master);
+  noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  setInterval(schedule, TICK_MS);
+  actx.resume();
+}
+
+/* ---- 신스 악기: 킥 / 하이햇 / 클랩 / 베이스 / 리드 ---- */
+function playKick(t) { // 사인파 피치 드롭
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(160, t);
+  o.frequency.exponentialRampToValueAtTime(44, t + 0.11);
+  g.gain.setValueAtTime(0.9, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+  o.connect(g); g.connect(musicBus);
+  o.start(t); o.stop(t + 0.3);
+}
+function playHat(t, vol) { // 노이즈 + 하이패스
+  const s = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+  s.buffer = noiseBuf; f.type = 'highpass'; f.frequency.value = 7500;
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.045);
+  s.connect(f); f.connect(g); g.connect(musicBus);
+  s.start(t); s.stop(t + 0.06);
+}
+function playClap(t) { // 노이즈 + 밴드패스 (백비트)
+  const s = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+  s.buffer = noiseBuf; f.type = 'bandpass'; f.frequency.value = 1800; f.Q.value = 1.2;
+  g.gain.setValueAtTime(0.16, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+  s.connect(f); f.connect(g); g.connect(musicBus);
+  s.start(t); s.stop(t + 0.12);
+}
+function playBass(t, freq, dur) { // 사각파 베이스
+  const o = actx.createOscillator(), f = actx.createBiquadFilter(), g = actx.createGain();
+  o.type = 'square'; o.frequency.value = freq;
+  f.type = 'lowpass'; f.frequency.value = 640;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.2, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(f); f.connect(g); g.connect(musicBus);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+function playLead(t, freq, dur) { // 톱니파 2개 디튠 + 로우패스 스윕
+  const g = actx.createGain(), f = actx.createBiquadFilter();
+  f.type = 'lowpass';
+  f.frequency.setValueAtTime(700, t);
+  f.frequency.exponentialRampToValueAtTime(2400, t + 0.04);
+  f.frequency.exponentialRampToValueAtTime(850, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.1, t + 0.012);
+  g.gain.setValueAtTime(0.1, t + Math.max(0.012, dur - 0.05));
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur + 0.08);
+  for (const det of [-6, 6]) {
+    const o = actx.createOscillator();
+    o.type = 'sawtooth'; o.frequency.value = freq; o.detune.value = det;
+    o.connect(f); o.start(t); o.stop(t + dur + 0.12);
+  }
+  f.connect(g); g.connect(musicBus);
+}
+function playTick(t, accent) { // 메트로놈 틱 (보정 화면)
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'square'; o.frequency.value = accent ? 1760 : 1175;
+  g.gain.setValueAtTime(accent ? 0.25 : 0.16, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.035);
+  o.connect(g); g.connect(sfxBus);
+  o.start(t); o.stop(t + 0.05);
+}
+function playHit(t, perfect) { // 착지 타격음: 짧은 클릭 + 핑 (완벽은 피치 상승)
+  const s = actx.createBufferSource(), hf = actx.createBiquadFilter(), ng = actx.createGain();
+  s.buffer = noiseBuf; hf.type = 'highpass'; hf.frequency.value = 4000;
+  ng.gain.setValueAtTime(0.14, t);
+  ng.gain.exponentialRampToValueAtTime(0.001, t + 0.02);
+  s.connect(hf); hf.connect(ng); ng.connect(sfxBus);
+  s.start(t); s.stop(t + 0.03);
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'triangle'; o.frequency.value = perfect ? 1318.5 : 987.8;
+  g.gain.setValueAtTime(0.13, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
+  o.connect(g); g.connect(sfxBus);
+  o.start(t); o.stop(t + 0.13);
+}
+function playFail(t) { // 미스: 하강 톱니파 + 노이즈 버스트
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'sawtooth';
+  o.frequency.setValueAtTime(220, t);
+  o.frequency.exponentialRampToValueAtTime(48, t + 0.45);
+  g.gain.setValueAtTime(0.22, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+  o.connect(g); g.connect(sfxBus);
+  o.start(t); o.stop(t + 0.55);
+  const s = actx.createBufferSource(), f = actx.createBiquadFilter(), ng = actx.createGain();
+  s.buffer = noiseBuf; f.type = 'lowpass'; f.frequency.value = 2500;
+  ng.gain.setValueAtTime(0.2, t);
+  ng.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+  s.connect(f); f.connect(ng); ng.connect(sfxBus);
+  s.start(t); s.stop(t + 0.35);
+}
+function playFanfare(t) { // 클리어 아르페지오 (Am)
+  [0, 3, 7, 12].forEach((semi, i) => {
+    const o = actx.createOscillator(), g = actx.createGain();
+    const tt = t + i * 0.13;
+    o.type = 'triangle'; o.frequency.value = noteFreq(semi);
+    g.gain.setValueAtTime(0.14, tt);
+    g.gain.exponentialRampToValueAtTime(0.001, tt + 0.5);
+    o.connect(g); g.connect(sfxBus);
+    o.start(tt); o.stop(tt + 0.55);
+  });
+}
+
+/* ---- 곡 데이터: 8마디 루프, A 마이너, 16분음표 128스텝 ---- */
+// 마디별 베이스 루트 (A4 기준 반음): Am Am F G / Am F C E
+const BASS_ROOTS = [-24, -24, -28, -26, -24, -28, -21, -29];
+// 리드 멜로디: [스텝, 반음, 길이(스텝)]
+const MELODY_EVENTS = [
+  [0, 0, 2], [4, 3, 2], [8, 7, 4], [14, 5, 2],
+  [16, 3, 2], [20, 2, 2], [24, 0, 6],
+  [32, 0, 2], [36, 3, 2], [40, 8, 4], [46, 7, 2],
+  [48, 5, 2], [52, 2, 2], [56, -2, 6],
+  [64, 7, 2], [68, 12, 4], [74, 10, 2], [76, 7, 2],
+  [80, 8, 2], [84, 7, 2], [88, 3, 4],
+  [96, 7, 2], [100, 10, 2], [104, 3, 4],
+  [112, 2, 4], [116, -1, 2], [120, 2, 6],
+];
+const MELODY = new Map(MELODY_EVENTS.map(e => [e[0], e]));
+
+// 현재 스케줄 시각(t0 기준 상대 초)의 BPM — 속도 변경 타일 반영
+function musicBpmAt(rel) {
+  let b = music.baseBpm;
+  for (const c of music.timeline) { if (rel >= c.rel - 1e-6) b = c.bpm; else break; }
+  return b;
+}
+// 한 스텝(16분음표) 분량의 음표 예약
+function scheduleStep(step, t) {
+  const bpm = musicBpmAt(t - music.t0);
+  const stepDur = 15 / bpm; // 60/bpm/4
+  const bar = Math.floor(step / 16) % 8;
+  if (step % 4 === 0) playKick(t);                        // 포온더플로어 킥
+  if (step % 4 === 2) playHat(t, 0.22);                   // 오프비트 하이햇
+  if (step % 16 === 7 || step % 16 === 15) playHat(t, 0.09); // 고스트 햇
+  if (step % 16 === 4 || step % 16 === 12) playClap(t);   // 백비트 클랩
+  if (step % 2 === 0) {                                   // 8분음표 베이스
+    let semi = BASS_ROOTS[bar];
+    if (step % 16 === 6) semi += 12;                      // 옥타브 점프
+    if (step % 16 === 14) semi += 7;                      // 5도
+    playBass(t, noteFreq(semi), stepDur * 1.7);
+  }
+  const m = MELODY.get(step % 128);                       // 리드 멜로디
+  if (m) playLead(t, noteFreq(m[1]), m[2] * stepDur);
+}
+
+// 룩어헤드 스케줄러 본체 — 25ms마다 실행, 100ms 앞까지 예약
+function schedule() {
+  if (!actx) return;
+  if (music.mode === 'music') {
+    while (music.nextTime < actx.currentTime + LOOKAHEAD) {
+      scheduleStep(music.step, music.nextTime);
+      const bpm = musicBpmAt(music.nextTime - music.t0);
+      music.nextTime += 15 / bpm;
+      music.step = (music.step + 1) % 128;
+    }
+  } else if (music.mode === 'calib') {
+    while (music.nextTime < actx.currentTime + LOOKAHEAD) {
+      playTick(music.nextTime, music.step % 4 === 0);
+      calib.beatTimes.push(music.nextTime);
+      if (calib.beatTimes.length > 24) calib.beatTimes.shift();
+      music.nextTime += 60 / 100; // 100 BPM 메트로놈
+      music.step++;
+    }
+  }
+}
+function stopMusic() { music.mode = 'off'; }
+
+/* ===================== 4. 레벨 데이터 ===================== */
+// angles[i] = 타일 i에서 타일 i+1로 가는 방향각(도). 화면 좌표계(y 아래) 기준.
+// vortex: 착지 시 공전 방향이 반전되는 타일 인덱스
+// speed:  {타일 인덱스: 기본 BPM 대비 배속} — 그 타일부터 적용
+const LEVELS = [
+  {
+    name: '튜토리얼', sub: '직선 · 일정한 박자', bpm: 100,
+    angles: rep(0, 32), vortex: [], speed: {},
+  },
+  {
+    name: '중급', sub: '90° 꺾임 · 소용돌이', bpm: 110,
+    angles: [
+      ...rep(0, 8),
+      270, 0, 270, 0, 270, 0,   // 계단 위로: 0.5 / 1.5 박 스윙
+      ...rep(0, 4),
+      0, 0, 0,                  // (18번 타일에 소용돌이)
+      270, 0, 270, 0, 270, 0,   // 같은 모양이지만 방향 반전 → 1.5 / 0.5 박
+      ...rep(0, 5),             // (27번 타일에 소용돌이로 복귀)
+    ],
+    vortex: [18, 27], speed: {},
+  },
+  {
+    name: '고급', sub: '45° 지그재그 · 속도 변화', bpm: 120,
+    angles: [
+      ...rep(0, 4),
+      45, 0, 315, 0, 45, 0, 315, 0, // 45° 스윙: 1.25 / 0.75 박
+      0, 0,
+      ...rep(0, 6),                 // (14번부터 1.5배속 직선)
+      0, 0,                         // (20번부터 원속)
+      ...rep(0, 4),                 // (22번부터 0.5배속 직선)
+      45, 315, 45, 315,             // (26번부터 원속) 대각 계단
+      ...rep(0, 4),
+    ],
+    vortex: [], speed: { 14: 1.5, 20: 1, 22: 0.5, 26: 1 },
+  },
+];
+
+/* ===================== 5. 타이밍 계산 (게임의 심장) ===================== */
+const TILE = 64;        // 타일 간 거리 = 공전 반지름(px)
+const INTRO_BEATS = 4;  // 첫 착지 전 카운트인 박자 수
+const TILE_TH = 26;     // 트랙 두께
+
+/*
+ * 트랙 전체의 이론상 도착 시각을 곡 시작 시점에 전부 미리 계산.
+ * 타일 i→i+1 이동:
+ *   시작각 = (i===0 ? angles[0] : angles[i-1]) + 180  (직전 타일을 가리키는 각)
+ *   목표각 = angles[i]
+ *   Δ = 공전 방향 d로 시작각에서 목표각까지 도는 각도 (0이면 360으로 처리)
+ *   박자 = Δ / 180,  소요 시간 = 박자 × (60 / 그 구간 BPM)
+ */
+function buildTiming(level) {
+  const N = level.angles.length;
+  const tiles = [];
+  let x = 0, y = 0, d = 1, mult = 1, arrival = 0;
+  for (let i = 0; i < N; i++) {
+    if (level.vortex.includes(i)) d = -d;                 // 소용돌이: 방향 반전
+    if (level.speed[i] !== undefined) mult = level.speed[i]; // 속도 변경
+    const bpm = level.bpm * mult, spb = 60 / bpm;
+    const startAngle = (i === 0 ? level.angles[0] : level.angles[i - 1]) + 180;
+    const target = level.angles[i];
+    let delta = mod360(d * (target - startAngle));
+    if (delta < 1e-9) delta = 360;                        // 완전 한 바퀴
+    const beats = delta / 180;
+    tiles.push({ x, y, out: level.angles[i], dir: d, bpm, spb,
+                 beats, delta, arrival,
+                 vortex: level.vortex.includes(i),
+                 speedMark: level.speed[i] });
+    arrival += beats * spb;
+    x += TILE * Math.cos(level.angles[i] * D2R);
+    y += TILE * Math.sin(level.angles[i] * D2R);
+  }
+  // 마지막 타일 (도착 지점)
+  tiles.push({ x, y, out: level.angles[N - 1], dir: d,
+               bpm: level.bpm * mult, spb: 60 / (level.bpm * mult),
+               beats: 0, delta: 0, arrival, vortex: false });
+  return tiles;
+}
+
+/* ===================== 6. 게임 상태 / 런 관리 ===================== */
+// 상태: title → calib → select → play ⇄ (pause/countdown/dead) → clear → result
+let state = 'title';
+let calibDone = false;
+let levelIdx = 0;
+let R = null; // 현재 런(run) 데이터
+
+const JUDGE = {
+  perfect: { txt: '완벽',      color: '#ffd76a', w: 1    },
+  early:   { txt: '살짝 빠름', color: '#7ad7ff', w: 0.75 },
+  late:    { txt: '살짝 느림', color: '#ffb08a', w: 0.75 },
+  early2:  { txt: '빠름!',     color: '#4aa8ff', w: 0.45 },
+  late2:   { txt: '느림!',     color: '#ff7a5c', w: 0.45 },
+};
+
+const calib = { taps: [], beatTimes: [], done: false };
+
+// 카메라 / 이펙트 상태
+const cam = { x: 0, y: 0 };
+let shake = 0;
+let popups = [], shocks = [], parts = [], trail = [], errTicks = [];
+let deadAnim = null;    // 죽은 행성 비행 애니메이션
+let clearT = 0;         // 클리어 시각
+let countdownT0 = 0;    // 일시정지 해제 카운트다운 시작(performance 기준 — 렌더링 전용)
+const grades = [null, null, null]; // 세션 내 레벨별 최고 등급
+
+function newStats(keepDeaths) {
+  const deaths = keepDeaths && R ? R.stats.deaths : 0;
+  return { perfect: 0, early: 0, late: 0, early2: 0, late2: 0,
+           deaths, inputs: 0, weight: 0 };
+}
+
+// 런 시작(및 미스 후 재시작). 음악과 판정 타임라인을 같은 t0에서 출발시킨다.
+function startRun(li, keepDeaths) {
+  const level = LEVELS[li];
+  const tiles = buildTiming(level);
+  const spb0 = 60 / level.bpm;
+  const musicStart = actx.currentTime + 0.3;      // 예약 여유
+  const t0 = musicStart + INTRO_BEATS * spb0;     // 타일 0 기준 시각
+  R = {
+    level, li, tiles, t0,
+    idx: 0,                                       // 현재 고정 행성이 있는 타일
+    lastLand: -1,
+    stats: newStats(keepDeaths),
+    finished: false,
+  };
+  // 음악 스케줄러 초기화 — BPM 변화 타임라인을 판정과 공유
+  music.mode = 'music';
+  music.step = 0;
+  music.nextTime = musicStart;
+  music.t0 = t0;
+  music.baseBpm = level.bpm;
+  music.timeline = [];
+  let prev = level.bpm;
+  for (const tl of tiles) {
+    if (tl.bpm !== prev) { music.timeline.push({ rel: tl.arrival, bpm: tl.bpm }); prev = tl.bpm; }
+  }
+  musicBus.gain.cancelScheduledValues(actx.currentTime);
+  musicBus.gain.setValueAtTime(0.72, actx.currentTime);
+  // 이펙트/카메라 초기화
+  popups = []; shocks = []; parts = []; trail = []; errTicks = [];
+  deadAnim = null; shake = 0;
+  cam.x = tiles[0].x + TILE; cam.y = tiles[0].y;
+  state = 'play';
+}
+function startGame(li) { levelIdx = li; startRun(li, false); }
+
+/* ---- 현재 공전 행성의 각도 (도착 시각에서 역산 → 항상 정확히 도착) ---- */
+function orbitAngle(now) {
+  const seg = R.tiles[R.idx];
+  const tArr = R.t0 + R.tiles[R.idx + 1].arrival;
+  const omega = 180 / seg.spb;                    // 도/초
+  return seg.out - seg.dir * omega * (tArr - now);
+}
+function orbitPos(now) {
+  const seg = R.tiles[R.idx];
+  const a = orbitAngle(now) * D2R;
+  return { x: seg.x + TILE * Math.cos(a), y: seg.y + TILE * Math.sin(a) };
+}
+
+/* ===================== 7. 판정 시스템 ===================== */
+/*
+ * 각도 기반 판정: 입력 시점과 이론상 도착 시각의 차이를 각도로 환산.
+ *   errDeg = (입력시각 - 도착시각) / spb × 180   (음수 = 빠름)
+ *   ±25° 완벽 / ±25~45° 살짝 / ±45~60° 빠름!·느림! / -60° 미만 과입력 미스
+ *   +60° 초과(입력 없이 지나침)는 update()에서 자동 미스
+ */
+function gamePress(tRaw) {
+  if (state !== 'play' || R.finished) return;
+  if (tRaw - R.lastLand < 0.045) return;          // 다중 키 동시 입력 보호
+  const t = tRaw - inputOffset;                    // 보정 오프셋 적용
+  const seg = R.tiles[R.idx];
+  const tArr = R.t0 + R.tiles[R.idx + 1].arrival;
+  const errDeg = (t - tArr) / seg.spb * 180;
+  if (errDeg < -60) { die(tRaw, '너무 빠름!'); return; }  // 과입력 → 행성 폭발
+  if (errDeg > 60)  { die(tRaw, '놓침'); return; }        // 방어적 처리
+  const a = Math.abs(errDeg);
+  let key;
+  if (a <= 25) key = 'perfect';
+  else if (a <= 45) key = errDeg < 0 ? 'early' : 'late';
+  else key = errDeg < 0 ? 'early2' : 'late2';
+  land(tRaw, key, errDeg);
+}
+
+function land(tRaw, key, errDeg) {
+  const j = JUDGE[key];
+  R.idx++;
+  R.lastLand = tRaw;
+  R.stats[key]++; R.stats.inputs++; R.stats.weight += j.w;
+  const tl = R.tiles[R.idx];
+  // 판정 팝업 + 충격파 + (완벽) 입자 + 카메라 흔들림
+  popups.push({ txt: j.txt, color: j.color, x: tl.x, y: tl.y, t0: tRaw });
+  shocks.push({ x: tl.x, y: tl.y, t0: tRaw });
+  if (key === 'perfect') {
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * TAU + Math.random() * 0.5;
+      parts.push({ x: tl.x, y: tl.y, vx: Math.cos(a) * 90, vy: Math.sin(a) * 90,
+                   t0: tRaw, life: 0.4, color: '#ffd76a' });
+    }
+  }
+  shake = key === 'perfect' ? 2 : 1.4;
+  trail = [];                                      // 공수 교대 → 잔상 리셋
+  errTicks.push({ deg: errDeg, t0: tRaw });
+  playHit(actx.currentTime, key === 'perfect');
+  if (R.idx >= R.tiles.length - 1) {               // 마지막 타일 착지 → 클리어
+    R.finished = true;
+    clearT = tRaw;
+    state = 'clear';
+    stopMusic();
+    musicBus.gain.setTargetAtTime(0, actx.currentTime + 0.4, 0.5);
+    playFanfare(actx.currentTime + 0.35);
+    finalizeResult();
+  }
+}
+
+// 결과 집계: 가중 정확도와 등급 (미스가 있으면 A 이하)
+function finalizeResult() {
+  const s = R.stats;
+  s.acc = s.inputs ? (s.weight / s.inputs) * 100 : 100;
+  let g;
+  if (s.acc >= 95) g = 'S'; else if (s.acc >= 88) g = 'A';
+  else if (s.acc >= 75) g = 'B'; else g = 'C';
+  if (s.deaths > 0 && g === 'S') g = 'A';
+  s.grade = g;
+  const order = ['C', 'B', 'A', 'S'];
+  if (!grades[R.li] || order.indexOf(g) > order.indexOf(grades[R.li])) grades[R.li] = g;
+}
+
+// 미스: 공전 행성이 궤도를 이탈해 날아가며 페이드아웃 → 1초 후 재시작
+function die(now, reason) {
+  const seg = R.tiles[R.idx];
+  const p = orbitPos(now);
+  const a = orbitAngle(now) * D2R;
+  const omega = (180 / seg.spb) * D2R;             // rad/초
+  const speed = omega * TILE;                      // 접선 속도
+  deadAnim = {
+    x: p.x, y: p.y,
+    vx: -Math.sin(a) * speed * seg.dir + Math.cos(a) * 40,
+    vy:  Math.cos(a) * speed * seg.dir + Math.sin(a) * 40,
+    t0: now, red: R.idx % 2 === 1,                 // 공전 중인 쪽 색
+  };
+  for (let i = 0; i < 10; i++) {                   // 폭발 입자
+    const pa = Math.random() * TAU, sp = 40 + Math.random() * 130;
+    parts.push({ x: p.x, y: p.y, vx: Math.cos(pa) * sp, vy: Math.sin(pa) * sp,
+                 t0: now, life: 0.7, color: deadAnim.red ? '#ff2d55' : '#00c2ff' });
+  }
+  popups.push({ txt: reason, color: '#ff5252', x: p.x, y: p.y, t0: now });
+  R.stats.deaths++;
+  shake = 3;
+  state = 'dead';
+  stopMusic();
+  musicBus.gain.setTargetAtTime(0, actx.currentTime, 0.12);
+  playFail(actx.currentTime);
+}
+
+/* ===================== 8. 입력 처리 ===================== */
+// keydown 즉시 AudioContext.currentTime을 캡처해 판정 지연 최소화
+const GAME_KEYS = new Set(['Space', 'KeyF', 'KeyJ']);
+let hotRects = []; // 이번 프레임의 클릭 가능 영역(버튼)
+
+window.addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  const t = actx ? actx.currentTime : 0;
+  if (e.code === 'Space') e.preventDefault();
+  handleAction(e.code, t);
+});
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const t = actx ? actx.currentTime : 0;
+  // 버튼 히트 테스트 먼저
+  for (const r of hotRects) {
+    if (e.clientX >= r.x && e.clientX <= r.x + r.w &&
+        e.clientY >= r.y && e.clientY <= r.y + r.h) { ensureAudio(); r.cb(); return; }
+  }
+  handleAction('__pointer', t);
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame(); // 탭 이탈 시 자동 일시정지
+});
+
+function pauseGame() {
+  state = 'pause';
+  actx.suspend(); // currentTime 동결 → 재개 시 음악 위치 정확히 복원
+}
+function resumeCountdown() {
+  state = 'countdown';
+  countdownT0 = performance.now();
+}
+function handleAction(code, t) {
+  switch (state) {
+    case 'title':
+      ensureAudio();
+      if (calibDone) { state = 'select'; }
+      else { enterCalib(); }
+      break;
+    case 'calib':
+      if (code === 'Escape') { finishCalib(true); break; }
+      if (code === 'Enter' && calib.done) { finishCalib(false); break; }
+      if (code === '__pointer' || GAME_KEYS.has(code)) calibTap(t);
+      break;
+    case 'select':
+      if (code === 'Escape') { state = 'title'; break; }
+      if (code === 'Digit1' || code === 'Numpad1') startGame(0);
+      else if (code === 'Digit2' || code === 'Numpad2') startGame(1);
+      else if (code === 'Digit3' || code === 'Numpad3') startGame(2);
+      break;
+    case 'play':
+      if (code === 'Escape') { pauseGame(); break; }
+      if (code === '__pointer' || GAME_KEYS.has(code)) gamePress(t);
+      break;
+    case 'pause':
+      if (code === 'KeyQ') { actx.resume(); stopMusic(); state = 'select'; break; }
+      if (code === 'Escape' || code === 'Enter' || code === '__pointer' || GAME_KEYS.has(code))
+        resumeCountdown();
+      break;
+    case 'result':
+      if (code === 'KeyR' || code === 'Enter') startGame(levelIdx);
+      else if (code === 'KeyL' || code === 'Escape') state = 'select';
+      break;
+    // countdown / dead / clear 중에는 입력 무시
+  }
+}
+
+/* ---- 보정 화면: 메트로놈 4비트에 8회 탭 → 평균 오차를 오프셋으로 ---- */
+function enterCalib() {
+  state = 'calib';
+  calib.taps.length = 0; calib.beatTimes.length = 0; calib.done = false;
+  music.mode = 'calib';
+  music.step = 0;
+  music.nextTime = actx.currentTime + 0.4;
+}
+function calibTap(t) {
+  if (calib.done) return;
+  // 가장 가까운 비트와의 오차 (앞뒤 ±0.3초 이내만 유효)
+  let best = null;
+  for (const bt of calib.beatTimes) {
+    const err = t - bt;
+    if (Math.abs(err) < 0.3 && (best === null || Math.abs(err) < Math.abs(best))) best = err;
+  }
+  if (best === null) return;
+  calib.taps.push(best);
+  playTick(actx.currentTime, false);
+  if (calib.taps.length >= 8) {
+    inputOffset = calib.taps.reduce((a, b) => a + b, 0) / calib.taps.length;
+    inputOffset = clamp(inputOffset, -0.2, 0.2);
+    calib.done = true;
+  }
+}
+function finishCalib(skipped) {
+  if (skipped) inputOffset = inputOffset || 0;
+  calibDone = true;
+  stopMusic();
+  state = 'select';
+}
+
+/* ===================== 9. 업데이트 (게임 로직 — 오디오 시계 기준) ===================== */
+function update() {
+  if (!actx) return;
+  const now = actx.currentTime;
+  if (state === 'play' && !R.finished) {
+    // 자동 미스: 목표각을 60도(=박자의 1/3) 지나치면 게임오버
+    const seg = R.tiles[R.idx];
+    const tArr = R.t0 + R.tiles[R.idx + 1].arrival;
+    if (now - inputOffset > tArr + seg.spb / 3) die(now, '놓침');
+  }
+  if (state === 'dead' && now - deadAnim.t0 > 1.0) {
+    startRun(R.li, true);                         // 1초 후 처음부터 재시작
+  }
+  if (state === 'clear' && now - clearT > 1.6) {
+    state = 'result';
+  }
+  if (state === 'countdown' && performance.now() - countdownT0 > 1800) {
+    state = 'play';
+    actx.resume();                                // 음악이 멈춘 지점에서 정확히 재개
+  }
+}
+
+/* ===================== 10. 렌더링 ===================== */
+let bgGrad = null, bgGradKey = '';
+function drawBackground(pulse) {
+  // 어두운 남색-보라 대각 그라데이션 (#0a0a14 → #14101f)
+  const key = W + 'x' + H;
+  if (bgGradKey !== key) {
+    bgGrad = ctx.createLinearGradient(0, 0, W, H);
+    bgGrad.addColorStop(0, '#0a0a14');
+    bgGrad.addColorStop(1, '#14101f');
+    bgGradKey = key;
+  }
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+  // 별 입자: 느리게 떠다니며 미세하게 깜빡임
+  const t = performance.now() / 1000;
+  for (const s of stars) {
+    s.x += 3 * s.z * 0.016;
+    if (s.x > W + 4) s.x = -4;
+    ctx.globalAlpha = 0.14 + 0.18 * (0.5 + 0.5 * Math.sin(t * 0.8 + s.tw));
+    ctx.fillStyle = '#cdd3ff';
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r * s.z, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  return pulse;
+}
+function drawVignette(pulse) {
+  ctx.globalAlpha = clamp(0.92 + 0.05 * pulse, 0, 1); // 비트 펄스 5% 이내
+  ctx.drawImage(vignetteCv, 0, 0, W, H);
+  ctx.globalAlpha = 1;
+}
+
+/* ---- 트랙: 둥근 세그먼트 2패스(외곽 → 채움)로 꺾임 이음새를 자연스럽게 ---- */
+function drawTrack() {
+  const tiles = R.tiles;
+  const segLen = TILE + 14; // 양끝 7px 연장 → 꺾임 부분이 겹치며 이어짐
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 0; i < tiles.length - 1; i++) {
+      const a = tiles[i], b = tiles[i + 1];
+      const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(a.out * D2R);
+      ctx.beginPath();
+      if (pass === 0) { // 1px 밝은 테두리 역할 (한 겹 크게 채움)
+        ctx.fillStyle = '#4a4a5f';
+        ctx.roundRect(-segLen / 2 - 1, -TILE_TH / 2 - 1, segLen + 2, TILE_TH + 2, 7);
+      } else {          // 본체 — 현재 진행 타일은 살짝 밝게
+        ctx.fillStyle = i === R.idx ? '#3a3a4e' : '#2a2a3a';
+        ctx.roundRect(-segLen / 2, -TILE_TH / 2, segLen, TILE_TH, 6);
+      }
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+  // 특수 타일 아이콘 + 도착 지점 링
+  for (let i = 1; i < tiles.length - 1; i++) {
+    const tl = tiles[i];
+    if (tl.vortex) drawVortexIcon(tl.x, tl.y);
+    if (tl.speedMark !== undefined) drawSpeedIcon(tl.x, tl.y, tl.out, tl.speedMark);
+  }
+  const goal = tiles[tiles.length - 1];
+  ctx.strokeStyle = 'rgba(255,215,106,0.7)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(goal.x, goal.y, 9, 0, TAU);
+  ctx.stroke();
+}
+function drawVortexIcon(x, y) { // 소용돌이: 나선
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.strokeStyle = '#c07aff'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (let a = 0; a <= 4.6; a += 0.25) {
+    const r = 1.5 + a * 1.75;
+    const px = Math.cos(a * 1.5) * r, py = Math.sin(a * 1.5) * r;
+    a === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+function drawSpeedIcon(x, y, ang, mult) { // 속도: 셰브런 (빠름 », 느림 «, 복귀 ·)
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(ang * D2R);
+  ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+  const chev = (ox, dir) => {
+    ctx.beginPath();
+    ctx.moveTo(ox - 3 * dir, -5); ctx.lineTo(ox + 3 * dir, 0); ctx.lineTo(ox - 3 * dir, 5);
+    ctx.stroke();
+  };
+  if (mult > 1)      { ctx.strokeStyle = '#ffb069'; chev(-4, 1); chev(3, 1); }
+  else if (mult < 1) { ctx.strokeStyle = '#7ad7ff'; chev(0, -1); }
+  else { // 원속 복귀 표시
+    ctx.strokeStyle = '#9a9ab0';
+    ctx.beginPath(); ctx.arc(0, 0, 4, 0, TAU); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ---- 행성: radial gradient + glow, 공전 행성 잔상 트레일 ---- */
+function drawPlanet(x, y, red, glow, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.shadowColor = red ? '#ff2d55' : '#00c2ff';
+  ctx.shadowBlur = 20 * glow;
+  const g = ctx.createRadialGradient(x - 4, y - 4, 2, x, y, 14);
+  if (red) { g.addColorStop(0, '#ffd9e0'); g.addColorStop(0.45, '#ff2d55'); g.addColorStop(1, '#a51236'); }
+  else     { g.addColorStop(0, '#d9f7ff'); g.addColorStop(0.45, '#00c2ff'); g.addColorStop(1, '#00688f'); }
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(x, y, 14, 0, TAU);
+  ctx.fill();
+  ctx.restore();
+}
+function drawTrail(red) {
+  for (let i = 0; i < trail.length; i++) {
+    const k = (i + 1) / trail.length;
+    ctx.globalAlpha = 0.28 * Math.pow(k, 1.6);
+    ctx.fillStyle = red ? '#ff2d55' : '#00c2ff';
+    ctx.beginPath();
+    ctx.arc(trail[i].x, trail[i].y, 14 * (0.35 + 0.5 * k), 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ---- 이펙트: 판정 팝업 / 충격파 링 / 입자 ---- */
+function drawEffects(now) {
+  // 충격파: 0.3초간 링 확장
+  shocks = shocks.filter(s => now - s.t0 < 0.3);
+  for (const s of shocks) {
+    const k = (now - s.t0) / 0.3;
+    ctx.globalAlpha = 0.55 * (1 - k);
+    ctx.strokeStyle = '#e8e8ff';
+    ctx.lineWidth = 2.5 * (1 - k) + 0.5;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, 8 + 38 * easeOutCubic(k), 0, TAU);
+    ctx.stroke();
+  }
+  // 입자
+  parts = parts.filter(p => now - p.t0 < p.life);
+  for (const p of parts) {
+    const k = (now - p.t0) / p.life;
+    ctx.globalAlpha = 1 - k;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x + p.vx * (now - p.t0), p.y + p.vy * (now - p.t0), 2.5 * (1 - k) + 0.5, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // 판정 팝업: 작게 시작 → 커지며 떠오르고 페이드아웃 (0.5초, cubic ease-out)
+  popups = popups.filter(p => now - p.t0 < 0.5);
+  for (const p of popups) {
+    const k = (now - p.t0) / 0.5, e = easeOutCubic(k);
+    ctx.save();
+    ctx.translate(p.x, p.y - 26 - 30 * e);
+    ctx.scale(0.55 + 0.6 * e, 0.55 + 0.6 * e);
+    ctx.globalAlpha = 1 - k * k;
+    ctx.fillStyle = p.color;
+    ctx.font = "600 17px 'Segoe UI','Pretendard',sans-serif";
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(p.txt, 0, 0);
+    ctx.restore();
+  }
+}
+
+/* ---- HUD: 정확도 / 진행도 / 히트 에러 바 ---- */
+function drawHUD(now) {
+  const s = R.stats;
+  const acc = s.inputs ? (s.weight / s.inputs) * 100 : 100;
+  ctx.font = "500 15px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = 'rgba(230,230,245,0.85)';
+  ctx.textAlign = 'left';
+  ctx.fillText(`정확도 ${acc.toFixed(1)}%`, 18, 16);
+  ctx.textAlign = 'right';
+  const prog = (R.idx / (R.tiles.length - 1)) * 100;
+  ctx.fillText(`진행 ${prog.toFixed(0)}%`, W - 18, 16);
+  if (s.deaths > 0) {
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(255,120,120,0.7)';
+    ctx.fillText(`재시도 ${s.deaths}`, 18, 38);
+  }
+  // 히트 에러 바: 중앙 = 완벽, ±60도 범위
+  const bw = Math.min(320, W * 0.6), bh = 6, bx = W / 2 - bw / 2, by = H - 42;
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 3); ctx.fill();
+  ctx.fillStyle = 'rgba(255,215,106,0.22)'; // 완벽 존 (±25/60)
+  const pz = bw * (25 / 60) / 2;
+  ctx.fillRect(W / 2 - pz, by, pz * 2, bh);
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillRect(W / 2 - 0.5, by - 3, 1, bh + 6);
+  errTicks = errTicks.filter(e => now - e.t0 < 1.8);
+  for (const e of errTicks) {
+    const k = (now - e.t0) / 1.8;
+    const x = W / 2 + clamp(e.deg / 60, -1, 1) * bw / 2;
+    ctx.globalAlpha = (1 - k) * 0.9;
+    ctx.fillStyle = Math.abs(e.deg) <= 25 ? '#ffd76a' : (e.deg < 0 ? '#7ad7ff' : '#ff9d6c');
+    ctx.fillRect(x - 1, by - 5, 2, bh + 10);
+  }
+  ctx.globalAlpha = 1;
+  // 인트로 힌트
+  if (R.idx === 0 && !R.finished) {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(220,220,240,0.55)';
+    ctx.font = "400 14px 'Segoe UI','Pretendard',sans-serif";
+    ctx.fillText('비트에 맞춰 스페이스 · F · J · 탭', W / 2, H - 70);
+  }
+}
+
+/* ---- 자간 있는 대문자 타이틀 텍스트 (canvas letterSpacing 미지원 대비 수동 구현) ---- */
+function drawSpacedText(txt, x, y, font, spacingEm, color) {
+  ctx.font = font;
+  ctx.textBaseline = 'middle';
+  const size = parseInt(font.match(/(\d+)px/)[1], 10);
+  const sp = size * spacingEm;
+  let total = 0;
+  for (const ch of txt) total += ctx.measureText(ch).width + sp;
+  total -= sp;
+  let cx = x - total / 2;
+  ctx.fillStyle = color;
+  ctx.textAlign = 'left';
+  for (const ch of txt) {
+    ctx.fillText(ch, cx, y);
+    cx += ctx.measureText(ch).width + sp;
+  }
+}
+
+/* ---- 화면: 버튼 헬퍼 ---- */
+function button(x, y, w, h, label, cb, sub) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(160,160,190,0.45)';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = 'rgba(235,235,250,0.92)';
+  ctx.font = "600 17px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + w / 2, y + h / 2 - (sub ? 10 : 0));
+  if (sub) {
+    ctx.fillStyle = 'rgba(180,180,205,0.65)';
+    ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
+    ctx.fillText(sub, x + w / 2, y + h / 2 + 13);
+  }
+  ctx.restore();
+  hotRects.push({ x, y, w, h, cb });
+}
+
+/* ---- 각 화면 렌더링 ---- */
+function drawTitle() {
+  drawBackground(0);
+  const t = performance.now() / 1000;
+  // 장식: 서로 공전하는 두 행성
+  const cx = W / 2, cy = H / 2 - 110, r = 42;
+  const a = t * 1.4;
+  drawPlanet(cx + Math.cos(a) * r, cy + Math.sin(a) * r, true, 1, 1);
+  drawPlanet(cx - Math.cos(a) * r, cy - Math.sin(a) * r, false, 1, 1);
+  drawSpacedText('ORBIT BEAT', W / 2, H / 2 + 10,
+                 "700 44px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
+  // "아무 키나 눌러 시작" — sine ease 깜빡임
+  ctx.globalAlpha = 0.35 + 0.45 * (0.5 + 0.5 * Math.sin(t * 2.2));
+  ctx.fillStyle = '#b9b9d4';
+  ctx.font = "400 16px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('아무 키나 눌러 시작', W / 2, H / 2 + 74);
+  ctx.globalAlpha = 1;
+  drawVignette(0);
+}
+
+function drawCalib() {
+  drawBackground(0);
+  const now = actx ? actx.currentTime : 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  drawSpacedText('CALIBRATION', W / 2, H * 0.22,
+                 "700 26px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
+  ctx.fillStyle = 'rgba(210,210,230,0.8)';
+  ctx.font = "400 15px 'Segoe UI','Pretendard',sans-serif";
+  ctx.fillText('메트로놈 소리에 맞춰 8회 탭하세요', W / 2, H * 0.32);
+  ctx.fillStyle = 'rgba(160,160,185,0.6)';
+  ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
+  ctx.fillText('ESC — 건너뛰기', W / 2, H * 0.32 + 26);
+  // 비트 펄스 원
+  let pulse = 0;
+  for (const bt of calib.beatTimes) {
+    const d = now - bt;
+    if (d >= 0 && d < 0.25) pulse = Math.max(pulse, 1 - d / 0.25);
+  }
+  ctx.strokeStyle = 'rgba(230,230,250,0.85)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(W / 2, H / 2 + 10, 26 + pulse * 10, 0, TAU); ctx.stroke();
+  ctx.fillStyle = `rgba(122,215,255,${0.15 + pulse * 0.5})`;
+  ctx.beginPath(); ctx.arc(W / 2, H / 2 + 10, 18, 0, TAU); ctx.fill();
+  // 탭 진행 점
+  for (let i = 0; i < 8; i++) {
+    ctx.fillStyle = i < calib.taps.length ? '#ffd76a' : 'rgba(255,255,255,0.15)';
+    ctx.beginPath();
+    ctx.arc(W / 2 - 70 + i * 20, H / 2 + 78, 4, 0, TAU);
+    ctx.fill();
+  }
+  if (calib.done) {
+    ctx.fillStyle = '#ffd76a';
+    ctx.font = "500 16px 'Segoe UI','Pretendard',sans-serif";
+    ctx.fillText(`오프셋 ${(inputOffset * 1000).toFixed(0)}ms`, W / 2, H / 2 + 118);
+    button(W / 2 - 80, H / 2 + 146, 160, 44, '완료 (Enter)', () => finishCalib(false));
+  }
+  drawVignette(0);
+}
+
+function drawSelect() {
+  drawBackground(0);
+  drawSpacedText('LEVEL SELECT', W / 2, H * 0.16,
+                 "700 26px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
+  const cw = Math.min(420, W - 60), ch = 74;
+  LEVELS.forEach((lv, i) => {
+    const y = H * 0.28 + i * (ch + 18);
+    button(W / 2 - cw / 2, y, cw, ch, `${i + 1}. ${lv.name}`,
+           () => startGame(i), `${lv.sub} · ${lv.bpm} BPM`);
+    if (grades[i]) {
+      ctx.fillStyle = { S: '#ffd76a', A: '#7ad7ff', B: '#9effa0', C: '#a8a8b8' }[grades[i]];
+      ctx.font = "700 24px 'Segoe UI','Pretendard',sans-serif";
+      ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      ctx.fillText(grades[i], W / 2 + cw / 2 - 22, y + ch / 2);
+    }
+  });
+  ctx.fillStyle = 'rgba(160,160,185,0.55)';
+  ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('숫자 키 또는 클릭 · ESC — 타이틀', W / 2, H * 0.28 + 3 * (ch + 18) + 16);
+  drawVignette(0);
+}
+
+function drawPlay() {
+  const now = actx.currentTime;
+  const seg = R.tiles[Math.min(R.idx, R.tiles.length - 2)];
+  // 비트 펄스: 박자 시작에서 튀고 감쇠 (5% 이내로 절제)
+  const segT0 = R.t0 + R.tiles[R.idx].arrival;
+  const frac = mod360(((now - segT0) / seg.spb) * 360) / 360 % 1;
+  const pulse = Math.pow(1 - (frac % 1), 2);
+  drawBackground(pulse);
+
+  // ---- 카메라: 두 행성 중간점을 lerp 0.08로 추적, 줌은 천천히 숨쉬듯 ----
+  const fixedTl = R.tiles[R.idx];
+  const op = state === 'dead' ? { x: deadAnim.x, y: deadAnim.y }
+           : R.finished ? R.tiles[R.tiles.length - 2]
+           : orbitPos(now);
+  const tx = (fixedTl.x + op.x) / 2, ty = (fixedTl.y + op.y) / 2;
+  cam.x = lerp(cam.x, tx, 0.08);
+  cam.y = lerp(cam.y, ty, 0.08);
+  const breathe = 1 + 0.08 * Math.sin((now - R.t0) * 0.33);
+  const scale = clamp(Math.min(W, H) / 760, 0.55, 1.15) * breathe;
+  shake *= 0.86;
+  const shx = (Math.random() * 2 - 1) * shake, shy = (Math.random() * 2 - 1) * shake;
+
+  ctx.save();
+  ctx.translate(W / 2 + shx, H / 2 + shy);
+  ctx.scale(scale, scale);
+  ctx.translate(-cam.x, -cam.y);
+
+  drawTrack();
+  drawEffects(now);
+
+  // ---- 행성: 짝수 idx = 빨강 고정 / 홀수 idx = 파랑 고정 (착지마다 교대) ----
+  const redFixed = R.idx % 2 === 0;
+  const glow = 1 + 0.05 * pulse;
+  if (state === 'dead') {
+    // 죽은 행성: 접선 방향으로 날아가며 페이드아웃
+    const dt = now - deadAnim.t0;
+    deadAnim.x += deadAnim.vx * 0.016;
+    deadAnim.y += deadAnim.vy * 0.016;
+    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1);
+    drawPlanet(deadAnim.x, deadAnim.y, deadAnim.red, glow, clamp(1 - dt / 0.9, 0, 1));
+  } else if (R.finished) {
+    const prev = R.tiles[R.tiles.length - 2];
+    drawPlanet(prev.x, prev.y, !redFixed, glow, 1);
+    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1);
+  } else {
+    // 잔상 트레일 12프레임 (알파 점감)
+    trail.push({ x: op.x, y: op.y });
+    if (trail.length > 12) trail.shift();
+    drawTrail(!redFixed);
+    drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1);
+    drawPlanet(op.x, op.y, !redFixed, glow, 1);
+  }
+  ctx.restore();
+
+  drawVignette(pulse);
+  drawHUD(now);
+}
+
+function drawPauseOverlay() {
+  ctx.fillStyle = 'rgba(6,6,12,0.72)';
+  ctx.fillRect(0, 0, W, H);
+  drawSpacedText('PAUSED', W / 2, H / 2 - 40,
+                 "700 30px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
+  ctx.fillStyle = 'rgba(200,200,220,0.8)';
+  ctx.font = "400 15px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('ESC / 탭 — 재개', W / 2, H / 2 + 14);
+  ctx.fillText('Q — 레벨 선택', W / 2, H / 2 + 42);
+}
+function drawCountdownOverlay() {
+  ctx.fillStyle = 'rgba(6,6,12,0.5)';
+  ctx.fillRect(0, 0, W, H);
+  const el = performance.now() - countdownT0;
+  const n = 3 - Math.floor(el / 600);
+  const k = (el % 600) / 600;
+  ctx.save();
+  ctx.translate(W / 2, H / 2);
+  ctx.scale(1 + 0.25 * easeOutCubic(k), 1 + 0.25 * easeOutCubic(k));
+  ctx.globalAlpha = 1 - k * 0.7;
+  ctx.fillStyle = '#e9e9f7';
+  ctx.font = "700 64px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(String(Math.max(1, n)), 0, 0);
+  ctx.restore();
+}
+
+function drawResult() {
+  drawBackground(0);
+  const s = R.stats;
+  drawSpacedText('RESULT', W / 2, H * 0.14,
+                 "700 28px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
+  // 등급
+  const gc = { S: '#ffd76a', A: '#7ad7ff', B: '#9effa0', C: '#a8a8b8' }[s.grade];
+  ctx.save();
+  ctx.shadowColor = gc; ctx.shadowBlur = 26;
+  ctx.fillStyle = gc;
+  ctx.font = "700 88px 'Segoe UI','Pretendard',sans-serif";
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(s.grade, W / 2, H * 0.32);
+  ctx.restore();
+  ctx.fillStyle = 'rgba(235,235,250,0.9)';
+  ctx.font = "500 18px 'Segoe UI','Pretendard',sans-serif";
+  ctx.fillText(`정확도 ${s.acc.toFixed(1)}%`, W / 2, H * 0.45);
+  // 판정별 카운트
+  const rows = [
+    ['완벽', s.perfect, '#ffd76a'],
+    ['살짝 빠름 / 느림', s.early + s.late, '#7ad7ff'],
+    ['빠름! / 느림!', s.early2 + s.late2, '#ff9d6c'],
+    ['미스 (재시작)', s.deaths, '#ff5252'],
+  ];
+  ctx.font = "400 15px 'Segoe UI','Pretendard',sans-serif";
+  rows.forEach((r, i) => {
+    const y = H * 0.53 + i * 26;
+    ctx.textAlign = 'right'; ctx.fillStyle = 'rgba(190,190,210,0.85)';
+    ctx.fillText(r[0], W / 2 + 30, y);
+    ctx.textAlign = 'left'; ctx.fillStyle = r[2];
+    ctx.fillText(String(r[1]), W / 2 + 48, y);
+  });
+  button(W / 2 - 170, H * 0.78, 160, 46, '다시하기 (R)', () => startGame(levelIdx));
+  button(W / 2 + 10, H * 0.78, 160, 46, '레벨 선택 (L)', () => { state = 'select'; });
+  drawVignette(0);
+}
+
+/* ===================== 11. 메인 루프 (rAF — 렌더링 전용) ===================== */
+function frame() {
+  update();
+  hotRects = [];
+  switch (state) {
+    case 'title':  drawTitle(); break;
+    case 'calib':  drawCalib(); break;
+    case 'select': drawSelect(); break;
+    case 'play':
+    case 'dead':
+    case 'clear':  drawPlay(); break;
+    case 'pause':      drawPlay(); drawPauseOverlay(); break;
+    case 'countdown':  drawPlay(); drawCountdownOverlay(); break;
+    case 'result': drawResult(); break;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ===================== 12. 테스트 훅 (자동 검증용 — 게임 동작에는 무관) ===================== */
+window.__OB = {
+  buildTiming, LEVELS, INTRO_BEATS, mod360,
+  get state() { return state; },
+  get run() { return R; },
+  get audioTime() { return actx ? actx.currentTime : -1; },
+  get offset() { return inputOffset; },
+  press() { const t = actx ? actx.currentTime : 0; gamePress(t); },
+  boot() { ensureAudio(); calibDone = true; state = 'select'; },
+  start(i) { ensureAudio(); calibDone = true; startGame(i); },
+};
+</script>
+</body>
+</html>
