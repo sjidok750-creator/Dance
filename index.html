@@ -2,13 +2,18 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a14">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>ORBIT BEAT</title>
 <style>
   /* 전체 화면 캔버스 — 스크롤/터치 제스처 차단 */
   html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden;
-               background:#0a0a14; touch-action:none;
-               -webkit-user-select:none; user-select:none; }
+               background:#0a0a14; touch-action:none; overscroll-behavior:none;
+               -webkit-user-select:none; user-select:none;
+               -webkit-touch-callout:none; }
   canvas { display:block; }
 </style>
 </head>
@@ -82,7 +87,14 @@ function resize() {
   }
 }
 window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
 resize();
+
+// 터치 기기 감지 — 안내 문구를 탭 기준으로 표시
+const IS_TOUCH = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+// 길게 눌러 컨텍스트 메뉴가 뜨는 것 방지 (모바일)
+window.addEventListener('contextmenu', e => e.preventDefault());
 
 /* ===================== 3. 오디오 엔진 (전부 합성) ===================== */
 let actx = null;                 // AudioContext — 첫 사용자 입력 시 생성
@@ -511,7 +523,7 @@ function die(now, reason) {
   const omega = (180 / seg.spb) * D2R;             // rad/초
   const speed = omega * TILE;                      // 접선 속도
   deadAnim = {
-    x: p.x, y: p.y,
+    x: p.x, y: p.y, x0: p.x, y0: p.y,              // x0/y0 기준 해석적 이동 (주사율 무관)
     vx: -Math.sin(a) * speed * seg.dir + Math.cos(a) * 40,
     vy:  Math.cos(a) * speed * seg.dir + Math.sin(a) * 40,
     t0: now, red: R.idx % 2 === 1,                 // 공전 중인 쪽 색
@@ -552,7 +564,8 @@ canvas.addEventListener('pointerdown', (e) => {
   handleAction('__pointer', t);
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && state === 'play') pauseGame(); // 탭 이탈 시 자동 일시정지
+  // 탭 이탈·화면 잠금 시 자동 일시정지 (카운트다운 중이면 일시정지로 되돌림)
+  if (document.hidden && (state === 'play' || state === 'countdown')) pauseGame();
 });
 
 function pauseGame() {
@@ -831,7 +844,20 @@ function drawHUD(now) {
   ctx.fillText(`정확도 ${acc.toFixed(1)}%`, 18, 16);
   ctx.textAlign = 'right';
   const prog = (R.idx / (R.tiles.length - 1)) * 100;
-  ctx.fillText(`진행 ${prog.toFixed(0)}%`, W - 18, 16);
+  ctx.fillText(`진행 ${prog.toFixed(0)}%`, W - 66, 24);
+  // 일시정지 버튼 (우상단) — 모바일에서 ESC 대체. 플레이 중에만 활성.
+  if (state === 'play') {
+    const pb = { x: W - 54, y: 10, w: 44, h: 44 };
+    ctx.fillStyle = 'rgba(255,255,255,0.05)';
+    ctx.strokeStyle = 'rgba(160,160,190,0.4)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(pb.x, pb.y, pb.w, pb.h, 10); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = 'rgba(220,220,240,0.85)';
+    ctx.fillRect(pb.x + 15, pb.y + 13, 4.5, 18);
+    ctx.fillRect(pb.x + 25, pb.y + 13, 4.5, 18);
+    hotRects.push({ ...pb, label: '일시정지',
+                    cb: () => { if (state === 'play') pauseGame(); } });
+  }
   if (s.deaths > 0) {
     ctx.textAlign = 'left';
     ctx.fillStyle = 'rgba(255,120,120,0.7)';
@@ -860,7 +886,8 @@ function drawHUD(now) {
     ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(220,220,240,0.55)';
     ctx.font = "400 14px 'Segoe UI','Pretendard',sans-serif";
-    ctx.fillText('비트에 맞춰 스페이스 · F · J · 탭', W / 2, H - 70);
+    ctx.fillText(IS_TOUCH ? '비트에 맞춰 화면을 탭' : '비트에 맞춰 스페이스 · F · J · 탭',
+                 W / 2, H - 70);
   }
 }
 
@@ -899,7 +926,7 @@ function button(x, y, w, h, label, cb, sub) {
     ctx.fillText(sub, x + w / 2, y + h / 2 + 13);
   }
   ctx.restore();
-  hotRects.push({ x, y, w, h, cb });
+  hotRects.push({ x, y, w, h, cb, label });
 }
 
 /* ---- 각 화면 렌더링 ---- */
@@ -911,14 +938,15 @@ function drawTitle() {
   const a = t * 1.4;
   drawPlanet(cx + Math.cos(a) * r, cy + Math.sin(a) * r, true, 1, 1);
   drawPlanet(cx - Math.cos(a) * r, cy - Math.sin(a) * r, false, 1, 1);
+  const ts = Math.round(Math.min(44, W * 0.095)); // 좁은 화면에서 제목이 넘치지 않게
   drawSpacedText('ORBIT BEAT', W / 2, H / 2 + 10,
-                 "700 44px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
-  // "아무 키나 눌러 시작" — sine ease 깜빡임
+                 `700 ${ts}px 'Segoe UI','Pretendard',sans-serif`, 0.3, '#e9e9f7');
+  // 시작 안내 — sine ease 깜빡임
   ctx.globalAlpha = 0.35 + 0.45 * (0.5 + 0.5 * Math.sin(t * 2.2));
   ctx.fillStyle = '#b9b9d4';
   ctx.font = "400 16px 'Segoe UI','Pretendard',sans-serif";
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText('아무 키나 눌러 시작', W / 2, H / 2 + 74);
+  ctx.fillText(IS_TOUCH ? '화면을 탭해 시작' : '아무 키나 눌러 시작', W / 2, H / 2 + 74);
   ctx.globalAlpha = 1;
   drawVignette(0);
 }
@@ -932,9 +960,11 @@ function drawCalib() {
   ctx.fillStyle = 'rgba(210,210,230,0.8)';
   ctx.font = "400 15px 'Segoe UI','Pretendard',sans-serif";
   ctx.fillText('메트로놈 소리에 맞춰 8회 탭하세요', W / 2, H * 0.32);
-  ctx.fillStyle = 'rgba(160,160,185,0.6)';
-  ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
-  ctx.fillText('ESC — 건너뛰기', W / 2, H * 0.32 + 26);
+  if (!IS_TOUCH) {
+    ctx.fillStyle = 'rgba(160,160,185,0.6)';
+    ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
+    ctx.fillText('ESC — 건너뛰기', W / 2, H * 0.32 + 26);
+  }
   // 비트 펄스 원
   let pulse = 0;
   for (const bt of calib.beatTimes) {
@@ -957,18 +987,26 @@ function drawCalib() {
     ctx.fillStyle = '#ffd76a';
     ctx.font = "500 16px 'Segoe UI','Pretendard',sans-serif";
     ctx.fillText(`오프셋 ${(inputOffset * 1000).toFixed(0)}ms`, W / 2, H / 2 + 118);
-    button(W / 2 - 80, H / 2 + 146, 160, 44, '완료 (Enter)', () => finishCalib(false));
+    button(W / 2 - 80, H / 2 + 146, 160, 44, IS_TOUCH ? '완료' : '완료 (Enter)',
+           () => finishCalib(false));
+  } else {
+    // 탭으로 건너뛰기 (모바일에서 ESC 대체) — 탭 판정 영역과 겹치지 않게 하단 배치
+    button(W / 2 - 80, H - 92, 160, 44, '건너뛰기', () => finishCalib(true));
   }
   drawVignette(0);
 }
 
 function drawSelect() {
   drawBackground(0);
+  const hs = Math.round(Math.min(26, W * 0.06));
   drawSpacedText('LEVEL SELECT', W / 2, H * 0.16,
-                 "700 26px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
-  const cw = Math.min(420, W - 60), ch = 74;
+                 `700 ${hs}px 'Segoe UI','Pretendard',sans-serif`, 0.3, '#e9e9f7');
+  // 카드 크기를 화면 높이에 맞춰 조정 (가로 모드 폰에서도 3개가 들어가게)
+  const cw = Math.min(420, W - 60);
+  const ch = Math.min(74, H * 0.115), gap = Math.min(18, H * 0.028);
+  const y0 = H * 0.26;
   LEVELS.forEach((lv, i) => {
-    const y = H * 0.28 + i * (ch + 18);
+    const y = y0 + i * (ch + gap);
     button(W / 2 - cw / 2, y, cw, ch, `${i + 1}. ${lv.name}`,
            () => startGame(i), `${lv.sub} · ${lv.bpm} BPM`);
     if (grades[i]) {
@@ -981,7 +1019,9 @@ function drawSelect() {
   ctx.fillStyle = 'rgba(160,160,185,0.55)';
   ctx.font = "400 13px 'Segoe UI','Pretendard',sans-serif";
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText('숫자 키 또는 클릭 · ESC — 타이틀', W / 2, H * 0.28 + 3 * (ch + 18) + 16);
+  ctx.fillText(IS_TOUCH ? '레벨을 탭하세요' : '숫자 키 또는 클릭 · ESC — 타이틀',
+               W / 2, y0 + 3 * (ch + gap) + 16);
+  button(14, 14, 92, 38, '타이틀', () => { state = 'title'; });
   drawVignette(0);
 }
 
@@ -1019,10 +1059,10 @@ function drawPlay() {
   const redFixed = R.idx % 2 === 0;
   const glow = 1 + 0.05 * pulse;
   if (state === 'dead') {
-    // 죽은 행성: 접선 방향으로 날아가며 페이드아웃
+    // 죽은 행성: 접선 방향으로 날아가며 페이드아웃 (시간 기반 — 120Hz에서도 동일 속도)
     const dt = now - deadAnim.t0;
-    deadAnim.x += deadAnim.vx * 0.016;
-    deadAnim.y += deadAnim.vy * 0.016;
+    deadAnim.x = deadAnim.x0 + deadAnim.vx * dt;
+    deadAnim.y = deadAnim.y0 + deadAnim.vy * dt;
     drawPlanet(fixedTl.x, fixedTl.y, redFixed, glow, 1);
     drawPlanet(deadAnim.x, deadAnim.y, deadAnim.red, glow, clamp(1 - dt / 0.9, 0, 1));
   } else if (R.finished) {
@@ -1046,13 +1086,18 @@ function drawPlay() {
 function drawPauseOverlay() {
   ctx.fillStyle = 'rgba(6,6,12,0.72)';
   ctx.fillRect(0, 0, W, H);
-  drawSpacedText('PAUSED', W / 2, H / 2 - 40,
+  drawSpacedText('PAUSED', W / 2, H / 2 - 50,
                  "700 30px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
-  ctx.fillStyle = 'rgba(200,200,220,0.8)';
-  ctx.font = "400 15px 'Segoe UI','Pretendard',sans-serif";
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText('ESC / 탭 — 재개', W / 2, H / 2 + 14);
-  ctx.fillText('Q — 레벨 선택', W / 2, H / 2 + 42);
+  if (!IS_TOUCH) {
+    ctx.fillStyle = 'rgba(200,200,220,0.75)';
+    ctx.font = "400 14px 'Segoe UI','Pretendard',sans-serif";
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('ESC — 재개 · Q — 레벨 선택', W / 2, H / 2 - 6);
+  }
+  const bw = Math.min(160, W / 2 - 25), by = H / 2 + (IS_TOUCH ? 10 : 32);
+  button(W / 2 - bw - 10, by, bw, 46, '재개', resumeCountdown);
+  button(W / 2 + 10, by, bw, 46, '레벨 선택',
+         () => { actx.resume(); stopMusic(); state = 'select'; });
 }
 function drawCountdownOverlay() {
   ctx.fillStyle = 'rgba(6,6,12,0.5)';
@@ -1074,8 +1119,9 @@ function drawCountdownOverlay() {
 function drawResult() {
   drawBackground(0);
   const s = R.stats;
+  const hs = Math.round(Math.min(28, W * 0.065));
   drawSpacedText('RESULT', W / 2, H * 0.14,
-                 "700 28px 'Segoe UI','Pretendard',sans-serif", 0.3, '#e9e9f7');
+                 `700 ${hs}px 'Segoe UI','Pretendard',sans-serif`, 0.3, '#e9e9f7');
   // 등급
   const gc = { S: '#ffd76a', A: '#7ad7ff', B: '#9effa0', C: '#a8a8b8' }[s.grade];
   ctx.save();
@@ -1103,8 +1149,11 @@ function drawResult() {
     ctx.textAlign = 'left'; ctx.fillStyle = r[2];
     ctx.fillText(String(r[1]), W / 2 + 48, y);
   });
-  button(W / 2 - 170, H * 0.78, 160, 46, '다시하기 (R)', () => startGame(levelIdx));
-  button(W / 2 + 10, H * 0.78, 160, 46, '레벨 선택 (L)', () => { state = 'select'; });
+  const bw = Math.min(160, W / 2 - 25);
+  button(W / 2 - bw - 10, H * 0.78, bw, 46, IS_TOUCH ? '다시하기' : '다시하기 (R)',
+         () => startGame(levelIdx));
+  button(W / 2 + 10, H * 0.78, bw, 46, IS_TOUCH ? '레벨 선택' : '레벨 선택 (L)',
+         () => { state = 'select'; });
   drawVignette(0);
 }
 
@@ -1137,6 +1186,7 @@ window.__OB = {
   press() { const t = actx ? actx.currentTime : 0; gamePress(t); },
   boot() { ensureAudio(); calibDone = true; state = 'select'; },
   start(i) { ensureAudio(); calibDone = true; startGame(i); },
+  get hotRects() { return hotRects; },
 };
 </script>
 </body>
