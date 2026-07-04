@@ -121,11 +121,24 @@ function unlockMedia() {
   const p = unmuteEl.play();
   if (p && p.catch) p.catch(() => {});
 }
+// iOS '킥': 제스처 안에서 무음 버퍼를 실제로 한 번 재생해야 출력 경로가 열린다.
+// (state가 running이어도 이걸 하기 전엔 소리가 안 나는 iOS 버그 대응 — 표준 기법)
+function kickAudio() {
+  if (!actx) return;
+  try {
+    const src = actx.createBufferSource();
+    src.buffer = actx.createBuffer(1, 1, 22050);
+    src.connect(actx.destination);
+    src.start(0);
+  } catch (e) {}
+}
 function unlockAudio() {
   unlockMedia();
   // 일시정지/카운트다운 중엔 의도적으로 suspend 상태이므로 건드리지 않는다
-  if (actx && actx.state !== 'running' && state !== 'pause' && state !== 'countdown')
-    actx.resume();
+  if (actx && state !== 'pause' && state !== 'countdown') {
+    if (actx.state !== 'running') actx.resume();
+    kickAudio();
+  }
 }
 window.addEventListener('pointerdown', unlockAudio, true);
 window.addEventListener('touchend', unlockAudio, true);
@@ -152,6 +165,7 @@ function ensureAudio() {
   for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
   setInterval(schedule, TICK_MS);
   actx.resume();
+  kickAudio(); // 생성 직후 제스처 안에서 출력 경로 개방 (iOS)
 }
 
 /* ---- 신스 악기: 킥 / 하이햇 / 클랩 / 베이스 / 리드 ---- */
@@ -208,13 +222,13 @@ function playLead(t, freq, dur) { // 톱니파 2개 디튠 + 로우패스 스윕
   }
   f.connect(g); g.connect(musicBus);
 }
-function playTick(t, accent) { // 메트로놈 틱 (보정 화면)
+function playTick(t, accent) { // 메트로놈 틱 (보정 화면) — 폰 스피커에서도 또렷하게
   const o = actx.createOscillator(), g = actx.createGain();
-  o.type = 'square'; o.frequency.value = accent ? 1760 : 1175;
-  g.gain.setValueAtTime(accent ? 0.25 : 0.16, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + 0.035);
+  o.type = 'square'; o.frequency.value = accent ? 1568 : 1046.5;
+  g.gain.setValueAtTime(accent ? 0.34 : 0.24, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.055);
   o.connect(g); g.connect(sfxBus);
-  o.start(t); o.stop(t + 0.05);
+  o.start(t); o.stop(t + 0.07);
 }
 function playHit(t, perfect) { // 착지 타격음: 짧은 클릭 + 핑 (완벽은 피치 상승)
   const s = actx.createBufferSource(), hf = actx.createBiquadFilter(), ng = actx.createGain();
@@ -310,6 +324,9 @@ function schedule() {
       music.step = (music.step + 1) % 128;
     }
   } else if (music.mode === 'calib') {
+    // 오디오가 실제로 구동되기 전엔 메트로놈 시작을 미룬다
+    // (iOS에서 첫 탭 직후 컨텍스트가 아직 안 열린 상태로 비트가 시작되는 것 방지)
+    if (actx.state !== 'running') { music.nextTime = actx.currentTime + 0.4; return; }
     while (music.nextTime < actx.currentTime + LOOKAHEAD) {
       playTick(music.nextTime, music.step % 4 === 0);
       calib.beatTimes.push(music.nextTime);
@@ -1238,6 +1255,7 @@ window.__OB = {
   get run() { return R; },
   get audioTime() { return actx ? actx.currentTime : -1; },
   get audioState() { return actx ? actx.state : 'none'; },
+  get calib() { return calib; },
   get offset() { return inputOffset; },
   press() { const t = actx ? actx.currentTime : 0; gamePress(t); },
   boot() { ensureAudio(); calibDone = true; state = 'select'; },
